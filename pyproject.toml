@@ -1,0 +1,32 @@
+[project]
+name = "mochi"
+version = "0.1.0"
+description = "Mochi - a baseline-aware PC health buddy (OS mini project)"
+requires-python = ">=3.11"
+dependencies = [
+    "psutil>=5.9",
+    "PySide6>=6.7",
+    "pyqtgraph>=0.13",
+    "numpy>=1.26",
+    "pywin32>=306; sys_platform == 'win32'",
+    "tzdata",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-qt>=4.4", "pytest-timeout>=2.3"]
+
+[project.scripts]
+mochi = "mochi.__main__:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+timeout = 300
+markers = [
+    "realmachine: runs light, capped real load on this PC (CPU, memory, disk, processes)",
+    "slow: takes more than a few seconds",
+    "ui: Qt user-interface tests (run offscreen)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning:pyqtgraph.*",
+]
+qt_api = "pyside6"

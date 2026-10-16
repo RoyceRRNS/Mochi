@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+
+# Mochi personal data never goes into the repo (STO-8).
+# The app keeps its data in %LOCALAPPDATA%\Mochi, but guard against copies here too.
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+mochi_data/
+logs/
+*.log
+exports/
+mochi_bench*.tmp
+.tmp_*/
+
+# Tooling
+.idea/
+.vscode/
