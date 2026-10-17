@@ -236,8 +236,10 @@ class Theme:
         QScrollBar:horizontal {{ height: 0; }}
         QTableWidget {{ background: {p.surface}; border: none; border-radius: 12px; gridline-color: {p.surface_alt};
                         selection-background-color: {p.info}; selection-color: {p.on_fill}; }}
+        QHeaderView {{ background: {p.surface_alt}; border: none; }}
         QHeaderView::section {{ background: {p.surface_alt}; color: {p.text_muted}; border: none; padding: 6px;
                                 font-weight: 700; }}
+        QTableCornerButton::section {{ background: {p.surface_alt}; border: none; }}
         QMenu {{ background: {p.surface}; color: {p.text}; border: 1px solid {p.surface_alt}; border-radius: 10px;
                  padding: 6px; }}
         QMenu::item {{ padding: 7px 22px; border-radius: 8px; }}

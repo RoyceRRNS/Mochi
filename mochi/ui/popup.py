@@ -46,7 +46,7 @@ class Popup(QWidget):
         self.persistent = persistent
         self.level = level
         self.reduce_motion = reduce_motion
-        self.setFixedWidth(400)
+        self.setFixedWidth(420)
         self.setAccessibleName(f"{title} {cause}")
         outer = QVBoxLayout(self)
         outer.setContentsMargins(14, 14, 14, 18)
@@ -85,12 +85,16 @@ class Popup(QWidget):
                 row.addWidget(b)
                 self.buttons.append(b)
         row.addStretch(1)
+        card.add(row)
         if link:
             lb = button(link[0], "Ghost", on_click=self._wrap(link[1]))
             lb.setFocusPolicy(Qt.NoFocus)
-            row.addWidget(lb)
+            link_row = QHBoxLayout()
+            link_row.setContentsMargins(0, 0, 0, 0)
+            link_row.addWidget(lb)
+            link_row.addStretch(1)
+            card.add(link_row)
             self.buttons.append(lb)
-        card.add(row)
         self._timer = QTimer(self)
         self._timer.setSingleShot(True)
         self._timer.timeout.connect(self.dismiss)

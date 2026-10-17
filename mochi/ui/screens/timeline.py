@@ -56,6 +56,7 @@ class TimelinePage(Page):
             b.setCheckable(True)
             b.setChecked(key == self.metric_key)
             b.clicked.connect(lambda _=False, k=key: self.set_metric(k))
+            b.setProperty("metric", key)
             self.metric_group.addButton(b)
             controls.addWidget(b)
         controls.addStretch(1)
@@ -65,6 +66,7 @@ class TimelinePage(Page):
             b.setCheckable(True)
             b.setChecked(secs == self.seconds)
             b.clicked.connect(lambda _=False, s=secs: self.set_range(s))
+            b.setProperty("seconds", secs)
             self.range_group.addButton(b)
             controls.addWidget(b)
         self.body.addLayout(controls)
@@ -111,10 +113,14 @@ class TimelinePage(Page):
 
     def set_metric(self, key: str) -> None:
         self.metric_key = key
+        for b in self.metric_group.buttons():
+            b.setChecked(b.property("metric") == key)
         self.refresh()
 
     def set_range(self, seconds: int) -> None:
         self.seconds = seconds
+        for b in self.range_group.buttons():
+            b.setChecked(b.property("seconds") == seconds)
         self.refresh()
 
     def on_show(self) -> None:
@@ -162,6 +168,8 @@ class TimelinePage(Page):
             return
         self.last_data = data
         self._draw(data)
+        if latest is not None:
+            self._nerd(latest)
 
     def _draw(self, data: dict) -> None:
         pal = THEME.palette

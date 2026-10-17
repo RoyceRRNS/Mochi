@@ -8,7 +8,8 @@ import sys
 import time
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QLineEdit, QProgressBar, QSlider, QTableWidget,
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QHBoxLayout, QHeaderView, QLineEdit, QProgressBar, QSlider,
+                               QTableWidget,
                                QTableWidgetItem, QWidget)
 
 from ... import __version__
@@ -116,6 +117,7 @@ class SettingsPage(Page):
         self.table.setHorizontalHeaderLabels(["App (exe name)", "Activity", ""])
         self.table.verticalHeader().setVisible(False)
         self.table.horizontalHeader().setStretchLastSection(False)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
         self.table.setColumnWidth(0, 300)
         self.table.setColumnWidth(1, 180)
         self.table.setColumnWidth(2, 110)

@@ -347,3 +347,25 @@ def test_startup_watcher_times_a_real_launch(tmp_path):
         w.stop()
     la = next(la for la in got if la.app == "python.exe:launch_dummy.py")
     assert la.settled and la.cold and 0.8 <= la.duration_s <= 4.0
+
+
+@pytest.mark.slow
+def test_ui_overhead_is_small(tmp_path):
+    """PERF-1/PERF-2 with the dashboard open (rendered offscreen so nothing pops up)."""
+    sys.path.insert(0, str(TOOLS))
+    from measure_overhead import measure
+
+    home = tmp_path / "home"
+    (home / "ui").mkdir(parents=True)
+    (home / "ui" / "config.json").write_text('{"onboarded": true}')
+    old = dict(os.environ)
+    os.environ.update(env_with_home(home))
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+    try:
+        res = measure([PY, "-m", "mochi", "--profile", "ui"], seconds=30, warmup=15)
+    finally:
+        os.environ.clear()
+        os.environ.update(old)
+    assert res["samples"] >= 20, res
+    assert res["cpu_avg_pct_of_total"] < 5.0, res   # PERF-1: <= 5% with the window open
+    assert res["private_mb_peak"] < 100.0, res      # PERF-2

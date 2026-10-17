@@ -156,3 +156,17 @@ class TestModel:
     def test_level_titles(self):
         assert Level.PSST.title == "Psst..." and Level.HEADS_UP.title == "Heads up!" and Level.UH_OH.title == "Uh-oh."
         assert Level.NONE.title == ""
+
+
+def test_blas_is_pinned_to_one_thread_before_numpy_loads():
+    """PERF-2: OpenBLAS would otherwise commit ~750 MB on a 32-thread CPU."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    code = ("import os, mochi, numpy; print(os.environ['OPENBLAS_NUM_THREADS'])")
+    env = {k: v for k, v in os.environ.items() if k not in ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS")}
+    env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
+    out = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=60)
+    assert out.stdout.strip() == "1", out.stderr

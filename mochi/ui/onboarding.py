@@ -44,6 +44,7 @@ class Onboarding(QDialog):
             lay = QVBoxLayout(page)
             m = MochiWidget(170)
             m.set_mood(mood)
+            m.setFocusPolicy(Qt.NoFocus)
             self.mascots.append(m)
             lay.addWidget(m, 0, Qt.AlignHCenter)
             lay.addWidget(label(title, "H1"), 0, Qt.AlignHCenter)

@@ -30,3 +30,13 @@ filterwarnings = [
     "ignore::DeprecationWarning:pyqtgraph.*",
 ]
 qt_api = "pyside6"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["mochi*"]
+
+[tool.setuptools.package-data]
+"mochi.ui" = ["fonts/*.ttf", "fonts/*.txt"]
