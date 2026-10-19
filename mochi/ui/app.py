@@ -34,8 +34,12 @@ def server_name(profile: str) -> str:
     return f"mochi-{user}-{profile}"
 
 
-def signal_running_instance(profile: str, timeout_ms: int = 1500) -> bool:
-    """Ask a running Mochi to show its window (LIF-2)."""
+def signal_running_instance(profile: str, message: bytes = b"show", timeout_ms: int = 1500) -> bool:
+    """Ask a running Mochi to show its window (LIF-2), or with ``b"quit"`` to save and quit.
+
+    Waits for the running copy's "ok" before hanging up: bytes written to a pipe the server
+    hasn't accepted yet can be dropped when the client disconnects.
+    """
     from PySide6.QtCore import QCoreApplication
 
     _app = QCoreApplication.instance() or QCoreApplication(sys.argv[:1])
@@ -43,11 +47,12 @@ def signal_running_instance(profile: str, timeout_ms: int = 1500) -> bool:
     sock.connectToServer(server_name(profile))
     if not sock.waitForConnected(timeout_ms):
         return False
-    sock.write(b"show\n")
+    sock.write(message + b"\n")
     sock.flush()
     sock.waitForBytesWritten(timeout_ms)
+    acked = sock.waitForReadyRead(timeout_ms) and bytes(sock.readAll()).strip() == b"ok"
     sock.disconnectFromServer()
-    return True
+    return acked or message == b"show"   # an older Mochi shows its window without replying
 
 
 class MochiApp(QObject):
@@ -124,13 +129,29 @@ class MochiApp(QObject):
         self.window.toast(msg)
 
     def _on_connection(self) -> None:
-        sock = self.server.nextPendingConnection()
-        if sock is None:
+        while (sock := self.server.nextPendingConnection()) is not None:
+            state = {"done": False}
+            sock.readyRead.connect(lambda s=sock, st=state: self._on_message(s, st))
+            # A client that hangs up without a readable message just wants the window.
+            sock.disconnected.connect(lambda st=state: None if st["done"] else self._handle(b"show", st))
+            sock.disconnected.connect(sock.deleteLater)
+            if sock.bytesAvailable():
+                self._on_message(sock, state)
+
+    def _on_message(self, sock: QLocalSocket, state: dict) -> None:
+        message = bytes(sock.readAll()).strip()
+        if not message or state["done"]:
             return
-        sock.waitForReadyRead(500)
-        sock.readAll()
-        self.window.show_and_raise()
-        sock.disconnectFromServer()
+        sock.write(b"ok\n")
+        sock.flush()
+        self._handle(message, state)
+
+    def _handle(self, message: bytes, state: dict) -> None:
+        state["done"] = True
+        if message == b"quit":
+            QTimer.singleShot(0, self.quit)
+        else:
+            self.window.show_and_raise()
 
     def _onboard(self) -> None:
         dlg = Onboarding(self.window, autostart_default=True)

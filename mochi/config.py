@@ -144,6 +144,7 @@ class Config:
     onboarded: bool = False
     nerd_stats: bool = False
     start_hidden: bool = False
+    sensor_helper: bool = False       # read CPU temperature and fans through the elevated helper
 
     # --------------------------------------------------------------------
     def z_thresholds(self) -> dict[Level, float]:

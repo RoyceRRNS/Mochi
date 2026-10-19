@@ -121,6 +121,82 @@ class TestWindowsAdapter:
         assert bh is None or bh.design_mwh or bh.full_mwh
 
 
+# ---------------------------------------------------- GPU, temperature, fans
+class TestRealSensors:
+    def test_gpu_temperature_and_fans_or_a_reason(self, win):
+        win.read_system()
+        time.sleep(1.1)
+        s = win.read_system()
+        for key, value in (("gpu", s.gpu_busy_pct), ("gpu_temp", s.gpu_temp_c), ("temp", s.temp_c),
+                           ("fan", s.fans or None)):
+            assert value is not None or s.unavailable.get(key), f"{key}: no reading and no reason"
+        if s.gpu_busy_pct is not None:
+            assert 0 <= s.gpu_busy_pct <= 100 and s.sources["gpu"]
+        if s.gpu_temp_c is not None:
+            assert 20 <= s.gpu_temp_c <= 110 and s.sources["gpu_temp"] == "graphics driver"
+        if s.gpu_mem_used is not None and s.gpu_mem_total:
+            assert 0 <= s.gpu_mem_used <= s.gpu_mem_total
+        if s.temp_c is not None:
+            assert 30 <= s.temp_c <= 110     # never the 27.9 °C ACPI placeholder
+
+    def test_display_adapters_report_power_state(self):
+        from mochi.platform.windows import display_adapters
+
+        adapters = display_adapters()
+        assert adapters and all(hwid.startswith("PCI\\") or hwid for hwid, _, _ in adapters)
+        assert all(state is None or 1 <= state <= 5 for _, _, state in adapters)
+
+    def test_gpu_sensors_from_the_driver(self):
+        from mochi.platform.windows import gpu_sensors
+
+        asked = []
+        gpus = gpu_sensors(lambda vd: asked.append(vd) or True)
+        assert all(g.ven_dev.startswith("VEN_") and "VEN_1414" not in g.ven_dev for g in gpus)  # no software renderer
+        assert [g.ven_dev for g in gpus] == asked
+        for g in gpus:
+            assert g.temp_c is None or 20 <= g.temp_c <= 110
+        assert all(g.vram is None for g in gpu_sensors(lambda vd: False))   # asleep: identified, never asked
+
+    def test_reading_the_gpu_is_cheap(self, win):
+        win.read_system()
+        t0 = time.perf_counter()
+        for _ in range(5):
+            win.read_system()
+        assert (time.perf_counter() - t0) / 5 < 0.1
+
+    def test_helper_process_exits_with_its_parent(self, tmp_path):
+        """The real helper, started without admin: it can't read Lenovo sensors, and quits when Mochi does."""
+        parent = sleeper(60)
+        out, stop = tmp_path / "sensors.json", tmp_path / "sensors.stop"
+        helper = subprocess.Popen([PY, "-m", "mochi.sensor_helper", "--out", str(out), "--stop", str(stop),
+                                   "--parent", str(parent.pid), "--interval", "1"], cwd=str(ROOT),
+                                  creationflags=0x08000000)
+        try:
+            time.sleep(2.5)
+            assert helper.poll() is None             # still watching its parent
+            parent.kill()
+            parent.wait(5)
+            assert helper.wait(15) == 0
+            assert not out.exists()                  # tidied up after itself
+        finally:
+            for p in (parent, helper):
+                if p.poll() is None:
+                    p.kill()
+
+    def test_helper_process_honours_the_stop_file(self, tmp_path):
+        out, stop = tmp_path / "sensors.json", tmp_path / "sensors.stop"
+        helper = subprocess.Popen([PY, "-m", "mochi.sensor_helper", "--out", str(out), "--stop", str(stop),
+                                   "--parent", str(os.getpid()), "--interval", "1"], cwd=str(ROOT),
+                                  creationflags=0x08000000)
+        try:
+            time.sleep(1.5)
+            stop.write_text("stop")
+            assert helper.wait(15) == 0
+        finally:
+            if helper.poll() is None:
+                helper.kill()
+
+
 # ---------------------------------------------------------------- actions
 def sleeper(seconds=60):
     return subprocess.Popen([PY, "-c", f"import time; time.sleep({seconds})"], creationflags=0x08000000)

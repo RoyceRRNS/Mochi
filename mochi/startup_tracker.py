@@ -131,6 +131,7 @@ class StartupWatcher:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._procs: dict[tuple[int, float], psutil.Process] = {}
+        self._poll_cpu: dict[tuple[int, float], float] = {}
         self.errors = 0
 
     def start(self) -> None:
@@ -171,6 +172,11 @@ class StartupWatcher:
                 continue
             if key is None:
                 continue
+            # Read each process once per poll: two launches can share a child (cmd.exe starting
+            # python.exe), and a second cpu_percent() microseconds later would read ~0%.
+            if key in self._poll_cpu:
+                total += self._poll_cpu[key]
+                continue
             cached = self._procs.get(key)
             try:
                 if cached is None:
@@ -178,11 +184,13 @@ class StartupWatcher:
                     # child as busy so a launch never looks settled too early.
                     self._procs[key] = p
                     p.cpu_percent(None)
-                    total += 100.0
+                    value = 100.0
                 else:
-                    total += cached.cpu_percent(None)
+                    value = cached.cpu_percent(None)
             except psutil.Error:
                 continue
+            self._poll_cpu[key] = value
+            total += value
         return total
 
     def _run(self) -> None:
@@ -222,6 +230,7 @@ class StartupWatcher:
                 known = pids
                 if time.monotonic() - last_cpu >= self.cpu_poll_s:
                     last_cpu = time.monotonic()
+                    self._poll_cpu = {}
                     for key in list(self.analyzer.watching):
                         p = self._procs.get(key)
                         result = None

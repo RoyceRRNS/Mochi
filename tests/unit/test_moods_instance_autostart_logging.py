@@ -4,6 +4,7 @@ import logging
 import subprocess
 import sys
 import textwrap
+import time
 
 import pytest
 
@@ -103,8 +104,17 @@ class TestInstanceLock:
         finally:
             p.kill()
             p.wait()
-        # the OS frees the lock when the holder dies: no stale lock
-        InstanceLock(tmp_path / "p.lock").acquire().release()
+        # The OS frees the lock when the holder dies: no stale lock. The venv's python.exe is a
+        # launcher whose child interpreter holds the lock and exits a moment after the kill.
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                InstanceLock(tmp_path / "p.lock").acquire().release()
+                break
+            except AlreadyRunning:
+                if time.monotonic() > deadline:
+                    raise
+                time.sleep(0.05)
 
 
 # --------------------------------------------------------------- autostart

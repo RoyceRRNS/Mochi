@@ -16,7 +16,7 @@ from typing import Callable
 
 from .baseline import BaselineStore
 from .config import Config
-from .model import METRICS, Z_METRICS, Level, Sample
+from .model import BASELINE_METRICS, METRICS, WATCH_METRICS, Level, Sample
 
 
 def level_floor_ok(metric: str, level: Level, x: float, sample: Sample, tjmax: float = 100.0) -> bool:
@@ -135,7 +135,8 @@ class Detector:
     def configure(self, cfg: Config) -> None:
         self.cfg = cfg
         self.zthr = cfg.z_thresholds()
-        self.trackers = {m: SustainTracker(cfg.sustain_seconds(), cfg.sustain_frac, cfg.sample_interval_s) for m in Z_METRICS}
+        self.trackers = {m: SustainTracker(cfg.sustain_seconds(), cfg.sustain_frac, cfg.sample_interval_s)
+                         for m in BASELINE_METRICS}
         self.abs_rules = self._abs_rules(cfg)
         self.abs_trackers: dict[tuple[str, str | None], SustainTracker] = {}
 
@@ -192,8 +193,9 @@ class Detector:
         bands: dict[str, tuple[float, float] | None] = {}
         levels: dict[str, str | None] = {}
 
-        for m in Z_METRICS:
+        for m in BASELINE_METRICS:
             info = METRICS[m]
+            watch_only = m in WATCH_METRICS   # learns a band for the timeline, never alerts
             x = sample.metrics.get(m)
             tracker = self.trackers[m]
             if x is None:
@@ -213,7 +215,8 @@ class Detector:
             levels[m] = level_name
 
             met = Level.NONE
-            if stat is not None and not learning and z is not None and (x - stat.mean) >= info.min_delta:
+            if (stat is not None and not learning and not watch_only and z is not None
+                    and (x - stat.mean) >= info.min_delta):
                 for lv in (Level.UH_OH, Level.HEADS_UP, Level.PSST):
                     if z > self.zthr[lv] and level_floor_ok(m, lv, x, sample, cfg.tjmax_c):
                         met = lv

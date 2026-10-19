@@ -12,7 +12,7 @@ import time
 
 import psutil
 
-from ..model import Battery, ProcRaw, SystemRaw, Volume
+from ..model import Battery, Fan, ProcRaw, SystemRaw, Volume
 from .base import AccessDenied, Platform, PlatformError, ProcessGone
 
 
@@ -112,6 +112,16 @@ class GenericPlatform(Platform):
             raw.temp_c = None
         if raw.temp_c is None:
             unavailable["temp"] = "no temperature sensor reported"
+        try:
+            fans = psutil.sensors_fans()  # type: ignore[attr-defined]
+            raw.fans = [Fan(e.label or f"{chip} {i + 1}", float(e.current))
+                        for chip, entries in fans.items() for i, e in enumerate(entries)][:8]
+        except Exception:
+            raw.fans = []
+        if not raw.fans:
+            unavailable["fan"] = "no fan sensor reported"
+        unavailable["gpu"] = "GPU load isn't reported here"
+        unavailable["gpu_temp"] = "GPU temperature isn't reported here"
         try:
             sb = psutil.sensors_battery()
         except Exception:

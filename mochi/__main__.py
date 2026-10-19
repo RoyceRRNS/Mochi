@@ -5,6 +5,7 @@
     python -m mochi --start-hidden      # start in the tray (used by autostart)
     python -m mochi --headless          # collector + engine only, no UI (overhead tests)
     python -m mochi --demo              # the clearly labelled demo profile (DEMO-2)
+    python -m mochi --quit              # ask the running Mochi to save everything and quit
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ def parse(argv: list[str] | None = None) -> argparse.Namespace:
     ap.add_argument("--seconds", type=float, default=0.0, help="headless: stop after this many seconds")
     ap.add_argument("--demo", action="store_true", help="turn on the demo profile (shorter waits)")
     ap.add_argument("--simulate", action="store_true", help="UI with simulated data (no real readings)")
+    ap.add_argument("--quit", action="store_true", help="ask the running Mochi to save everything and quit")
     return ap.parse_args(argv)
 
 
@@ -73,6 +75,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         lock.acquire()
     except AlreadyRunning:
+        if args.quit:
+            from .ui.app import signal_running_instance
+
+            if signal_running_instance(profile, b"quit"):
+                return 0
+            print(f"Couldn't reach the running Mochi for profile '{profile}'.", file=sys.stderr)
+            return 3
         if not args.headless:
             from .ui.app import signal_running_instance
 
@@ -80,6 +89,10 @@ def main(argv: list[str] | None = None) -> int:
                 return 0
         print(f"Mochi is already running for profile '{profile}'.", file=sys.stderr)
         return 3
+    if args.quit:
+        lock.release()
+        print(f"Mochi isn't running for profile '{profile}'.", file=sys.stderr)
+        return 1
     try:
         if args.headless:
             return run_headless(paths, args.seconds, profile)

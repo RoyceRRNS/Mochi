@@ -116,13 +116,50 @@ def test_onboarding_saves_choice(ctrl, sim, monkeypatch):
     assert sim.engine.base_cfg.onboarded and sim.engine.base_cfg.autostart and sim.engine.autostart.is_enabled()
 
 
+def second_launch(message: bytes = b"show"):
+    """A real second process asking the running Mochi for something (Qt's pipe I/O needs its own process)."""
+    import subprocess
+    import sys
+
+    code = f"from mochi.ui.app import signal_running_instance as s; print(s('uitest', {message!r}))"
+    return subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True,
+                            cwd=str(Path(__file__).resolve().parents[2]))
+
+
 def test_single_instance_handshake(ctrl, qtbot):
     from mochi.ui.app import signal_running_instance
 
     ctrl.window.hide()
-    assert signal_running_instance("uitest")
-    qtbot.waitUntil(lambda: ctrl.window.isVisible(), timeout=3000)
+    p = second_launch()
+    qtbot.waitUntil(lambda: ctrl.window.isVisible() and p.poll() is not None, timeout=10000)
+    assert p.stdout.read().strip() == "True"
     assert not signal_running_instance("nobody-listens", timeout_ms=200)
+
+
+def test_old_style_client_still_shows_the_window(ctrl, qtbot):
+    from PySide6.QtNetwork import QLocalSocket
+
+    from mochi.ui.app import server_name
+
+    ctrl.window.hide()
+    sock = QLocalSocket()
+    sock.connectToServer(server_name("uitest"))
+    assert sock.waitForConnected(1000)
+    sock.disconnectFromServer()                       # hangs up without a message
+    qtbot.waitUntil(lambda: ctrl.window.isVisible(), timeout=3000)
+
+
+def test_quit_command_saves_and_quits(ctrl, qtbot, monkeypatch):
+    from mochi.__main__ import main
+
+    quits = []
+    monkeypatch.setattr(ctrl, "quit", lambda: quits.append(1))
+    ctrl.window.hide()
+    p = second_launch(b"quit")
+    qtbot.waitUntil(lambda: quits == [1] and p.poll() is not None, timeout=10000)
+    assert p.stdout.read().strip() == "True"                 # the running copy acknowledged
+    assert not ctrl.window.isVisible()                       # quitting doesn't pop the window up first
+    assert main(["--quit", "--profile", "nobody-runs-this"]) == 1
 
 
 def test_sim_driver_runs_the_demo_script(qapp, qtbot):

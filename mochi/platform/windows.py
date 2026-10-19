@@ -8,8 +8,12 @@ Design notes (see the critique, problem 5):
 - Paging, commit, disk busy/latency, run queue and throttling come from performance
   counters (PDH), because psutil doesn't expose them on Windows.
 - Battery drain comes from ``CallNtPowerInformation(SystemBatteryState)``.
-- Temperature needs admin or LibreHardwareMonitor, so it's optional and reported as
-  "unavailable (reason)" otherwise.
+- GPU load and memory come from the same GPU Engine / GPU Adapter Memory counters Task
+  Manager uses, and GPU temperature from the performance data the graphics driver gives
+  Windows (``D3DKMTQueryAdapterInfo``, also what Task Manager shows). It's only asked while
+  the GPU is awake: polling a sleeping laptop GPU could wake it.
+- CPU temperature and fans need admin or LibreHardwareMonitor on most PCs (see
+  mochi/sensors.py), so they're optional and reported as "unavailable (reason)" otherwise.
 """
 
 from __future__ import annotations
@@ -21,10 +25,13 @@ import subprocess
 import threading
 import time
 from ctypes import wintypes
+from dataclasses import dataclass
+from typing import Callable
 
 import psutil
 
-from ..model import Battery, ProcRaw, SystemRaw, Volume
+from ..model import Battery, Fan, ProcRaw, SystemRaw, Volume
+from ..sensors import ACPI, merge, plausible_temp, read_lhm
 from .base import (
     AccessDenied,
     BatteryHealth,
@@ -44,6 +51,8 @@ user32 = ctypes.WinDLL("user32", use_last_error=True)
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 shell32 = ctypes.WinDLL("shell32")
 powrprof = ctypes.WinDLL("powrprof")
+setupapi = ctypes.WinDLL("setupapi", use_last_error=True)
+gdi32 = ctypes.WinDLL("gdi32")
 
 EPOCH_DIFF = 11644473600.0  # seconds between 1601-01-01 and 1970-01-01
 STATUS_INFO_LENGTH_MISMATCH = 0xC0000004
@@ -190,8 +199,178 @@ PDH_COUNTERS = {
     "run_queue": r"\System\Processor Queue Length",
     "perf": r"\Processor Information(_Total)\% Processor Performance",
     "perf_limit": r"\Processor Information(_Total)\% Performance Limit",
+    "gpu_engine": r"\GPU Engine(*)\Utilization Percentage",
+    "gpu_mem": r"\GPU Adapter Memory(*)\Dedicated Usage",
 }
-WILDCARD = {"disk_idle", "disk_latency"}
+WILDCARD = {"disk_idle", "disk_latency", "gpu_engine", "gpu_mem"}
+
+
+def gpu_busy(engines: dict[str, float]) -> float:
+    """Task Manager's GPU %: add up every process's share of each engine, then take the busiest engine.
+
+    Instance names look like ``pid_1234_luid_0x0_0x107DC_phys_0_eng_0_engtype_3D``; only the
+    part after the process id names the engine. Process ids are never stored.
+    """
+    per: dict[str, float] = {}
+    for inst, v in engines.items():
+        key = inst.split("_luid_", 1)[-1]
+        per[key] = per.get(key, 0.0) + max(0.0, float(v))
+    return min(100.0, max(per.values(), default=0.0))
+
+
+# --- display adapters and their power state (SetupAPI; never touches the device itself) ---
+class SP_DEVINFO_DATA(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.DWORD), ("ClassGuid", ctypes.c_byte * 16), ("DevInst", wintypes.DWORD),
+                ("Reserved", ctypes.c_void_p)]
+
+
+_DISPLAY_CLASS = (ctypes.c_byte * 16).from_buffer_copy(
+    bytes.fromhex("68e9364d25e3ce11bfc108002be10318"))  # GUID_DEVCLASS_DISPLAY {4d36e968-e325-11ce-...}
+setupapi.SetupDiGetClassDevsW.restype = ctypes.c_void_p
+setupapi.SetupDiGetClassDevsW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_void_p, wintypes.DWORD]
+setupapi.SetupDiEnumDeviceInfo.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.POINTER(SP_DEVINFO_DATA)]
+setupapi.SetupDiGetDeviceRegistryPropertyW.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(SP_DEVINFO_DATA), wintypes.DWORD, ctypes.c_void_p, ctypes.c_void_p,
+    wintypes.DWORD, ctypes.c_void_p]
+setupapi.SetupDiDestroyDeviceInfoList.argtypes = [ctypes.c_void_p]
+
+
+def _wide(raw: bytes) -> str:
+    """The first string of a REG_SZ / REG_MULTI_SZ buffer."""
+    return raw.decode("utf-16-le", errors="replace").split("\x00", 1)[0]
+
+
+def display_adapters() -> list[tuple[str, str, int | None]]:
+    """(hardware id, name, most recent power state) per display adapter. State 1 = D0 (awake), 4 = D3."""
+    h = setupapi.SetupDiGetClassDevsW(ctypes.byref(_DISPLAY_CLASS), None, None, 0x2)  # DIGCF_PRESENT
+    if not h or h == ctypes.c_void_p(-1).value:
+        return []
+    out = []
+    try:
+        i = 0
+        while True:
+            info = SP_DEVINFO_DATA()
+            info.cbSize = ctypes.sizeof(info)
+            if not setupapi.SetupDiEnumDeviceInfo(h, i, ctypes.byref(info)):
+                break
+            i += 1
+            props = {}
+            for prop in (0x1, 0x0, 0x1E):  # SPDRP_HARDWAREID, SPDRP_DEVICEDESC, SPDRP_DEVICE_POWER_DATA
+                buf = ctypes.create_string_buffer(1024)
+                size = wintypes.DWORD()
+                if setupapi.SetupDiGetDeviceRegistryPropertyW(h, ctypes.byref(info), prop, None, buf, 1024,
+                                                              ctypes.byref(size)):
+                    props[prop] = buf.raw[:size.value]
+            if 0x1 not in props:
+                continue
+            state = int.from_bytes(props[0x1E][4:8], "little") if len(props.get(0x1E, b"")) >= 8 else None
+            out.append((_wide(props[0x1]).upper(), _wide(props.get(0x0, b"")), state))
+    finally:
+        setupapi.SetupDiDestroyDeviceInfoList(h)
+    return out
+
+
+# --- GPU sensors the graphics driver reports to Windows (D3DKMT, no admin, no extra DLLs) ---
+class _LUID(ctypes.Structure):
+    _fields_ = [("LowPart", wintypes.DWORD), ("HighPart", wintypes.LONG)]
+
+
+class _ADAPTERINFO(ctypes.Structure):
+    _fields_ = [("hAdapter", ctypes.c_uint), ("AdapterLuid", _LUID), ("NumOfSources", wintypes.ULONG),
+                ("bPrecisePresentRegionsPreferred", wintypes.BOOL)]
+
+
+class _ENUMADAPTERS2(ctypes.Structure):
+    _fields_ = [("NumAdapters", wintypes.ULONG), ("pAdapters", ctypes.POINTER(_ADAPTERINFO))]
+
+
+class _QUERYADAPTERINFO(ctypes.Structure):
+    _fields_ = [("hAdapter", ctypes.c_uint), ("Type", ctypes.c_int), ("pPrivateDriverData", ctypes.c_void_p),
+                ("PrivateDriverDataSize", ctypes.c_uint)]
+
+
+class _DEVICEIDS(ctypes.Structure):
+    _fields_ = [("PhysicalAdapterIndex", ctypes.c_uint), ("VendorID", ctypes.c_uint), ("DeviceID", ctypes.c_uint),
+                ("SubVendorID", ctypes.c_uint), ("SubSystemID", ctypes.c_uint), ("RevisionID", ctypes.c_uint),
+                ("BusType", ctypes.c_uint)]
+
+
+class _SEGMENTSIZE(ctypes.Structure):
+    _fields_ = [("DedicatedVideoMemorySize", ctypes.c_ulonglong), ("DedicatedSystemMemorySize", ctypes.c_ulonglong),
+                ("SharedSystemMemorySize", ctypes.c_ulonglong)]
+
+
+class _PERFDATA(ctypes.Structure):
+    _fields_ = [("PhysicalAdapterIndex", ctypes.c_uint32), ("MemoryFrequency", ctypes.c_ulonglong),
+                ("MaxMemoryFrequency", ctypes.c_ulonglong), ("MaxMemoryFrequencyOC", ctypes.c_ulonglong),
+                ("MemoryBandwidth", ctypes.c_ulonglong), ("PCIEBandwidth", ctypes.c_ulonglong),
+                ("FanRPM", wintypes.ULONG), ("Power", wintypes.ULONG), ("Temperature", wintypes.ULONG),
+                ("PowerStateOverride", ctypes.c_ubyte)]
+
+
+class _PERFDATACAPS(ctypes.Structure):
+    _fields_ = [("PhysicalAdapterIndex", ctypes.c_uint32), ("MaxMemoryBandwidth", ctypes.c_ulonglong),
+                ("MaxPCIEBandwidth", ctypes.c_ulonglong), ("MaxFanRPM", wintypes.ULONG),
+                ("TemperatureMax", wintypes.ULONG), ("TemperatureWarning", wintypes.ULONG)]
+
+
+class _CLOSEADAPTER(ctypes.Structure):
+    _fields_ = [("hAdapter", ctypes.c_uint)]
+
+
+QAI_SEGMENTSIZE, QAI_DEVICEIDS, QAI_PERFDATA, QAI_PERFDATACAPS = 3, 31, 62, 63
+SOFTWARE_RENDERER = 0x1414          # Microsoft Basic Render Driver: not a real GPU
+for _fn in ("D3DKMTEnumAdapters2", "D3DKMTQueryAdapterInfo", "D3DKMTCloseAdapter"):
+    getattr(gdi32, _fn).restype = ctypes.c_long
+
+
+@dataclass
+class GpuSensor:
+    ven_dev: str                     # "VEN_10DE&DEV_2860", matches the PnP hardware id
+    vram: int | None = None          # dedicated video memory, bytes
+    temp_c: float | None = None
+    temp_max_c: float | None = None
+    fan_rpm: float | None = None
+    fan_max_rpm: float | None = None
+
+
+def _query(h: int, qtype: int, out: ctypes.Structure) -> bool:
+    q = _QUERYADAPTERINFO(h, qtype, ctypes.cast(ctypes.byref(out), ctypes.c_void_p), ctypes.sizeof(out))
+    return gdi32.D3DKMTQueryAdapterInfo(ctypes.byref(q)) == 0
+
+
+def gpu_sensors(awake: Callable[[str], bool]) -> list[GpuSensor]:
+    """Every hardware GPU with what its driver reports. ``awake(ven_dev)`` gates the queries,
+    so a sleeping GPU is only identified, never asked for readings."""
+    e = _ENUMADAPTERS2()
+    if gdi32.D3DKMTEnumAdapters2(ctypes.byref(e)) != 0 or not e.NumAdapters:
+        return []
+    arr = (_ADAPTERINFO * e.NumAdapters)()
+    e.pAdapters = arr
+    if gdi32.D3DKMTEnumAdapters2(ctypes.byref(e)) != 0:
+        return []
+    out = []
+    try:
+        for a in arr[:e.NumAdapters]:
+            ids = _DEVICEIDS()
+            if not _query(a.hAdapter, QAI_DEVICEIDS, ids) or ids.VendorID in (0, SOFTWARE_RENDERER):
+                continue
+            g = GpuSensor(f"VEN_{ids.VendorID:04X}&DEV_{ids.DeviceID:04X}")
+            if awake(g.ven_dev):
+                seg, pd, caps = _SEGMENTSIZE(), _PERFDATA(), _PERFDATACAPS()
+                if _query(a.hAdapter, QAI_SEGMENTSIZE, seg):
+                    g.vram = int(seg.DedicatedVideoMemorySize) or None
+                if _query(a.hAdapter, QAI_PERFDATA, pd):
+                    g.temp_c = plausible_temp(pd.Temperature / 10.0)   # deci-degrees Celsius
+                    g.fan_rpm = float(pd.FanRPM) or None
+                if _query(a.hAdapter, QAI_PERFDATACAPS, caps):
+                    g.temp_max_c = caps.TemperatureMax / 10.0 or None
+                    g.fan_max_rpm = float(caps.MaxFanRPM) or None
+            out.append(g)
+    finally:
+        for a in arr[:e.NumAdapters]:
+            gdi32.D3DKMTCloseAdapter(ctypes.byref(_CLOSEADAPTER(a.hAdapter)))
+    return out
 
 
 class _Pdh:
@@ -247,9 +426,11 @@ class WindowsPlatform(Platform):
         self._exe_cache: dict[tuple[int, int], str | None] = {}
         self._file_cache: dict[str, FileInfo] = {}
         self._volumes_cache: tuple[float, list[str]] = (0.0, [])
-        self._temp_checked_at = 0.0
-        self._temp_reason = "needs admin or LibreHardwareMonitor"
-        self._temp_value: float | None = None
+        self._lhm_next = 0.0
+        self._lhm_value = None
+        self._acpi_next = 0.0
+        self._acpi_value: float | None = None
+        self._vram: dict[str, int] = {}   # last known video memory per GPU (also while it sleeps)
         self._ncpu = psutil.cpu_count() or 1
         self._self_pid = os.getpid()
         self._is_admin: bool | None = None
@@ -433,9 +614,9 @@ class WindowsPlatform(Platform):
         if raw.battery is None:
             unavailable["discharge"] = "no battery (desktop or not reported)"
 
-        raw.temp_c = self._temperature()
-        if raw.temp_c is None:
-            unavailable["temp"] = self._temp_reason
+        raw.unavailable = unavailable
+        self._gpu(raw, counters)
+        self._heat(raw)
 
         raw.idle_seconds = _idle_seconds()
         fg_pid, fullscreen_rect = _foreground()
@@ -482,44 +663,72 @@ class WindowsPlatform(Platform):
         discharge = (-rate / 1000.0) if rate < 0 else 0.0
         return Battery(percent=pct or 0.0, on_ac=bool(st.AcOnLine), discharge_w=discharge, present=True)
 
-    def _temperature(self) -> float | None:
-        now = time.monotonic()
-        if now - self._temp_checked_at < 30.0:
-            return self._temp_value
-        self._temp_checked_at = now
-        self._temp_value = None
+    def _gpu(self, raw: SystemRaw, counters: dict[str, object]) -> None:
+        """GPU load and memory for any GPU; temperature (and a GPU fan) while the GPU is awake."""
+        unavailable = raw.unavailable
+        engines = counters.get("gpu_engine")
+        if isinstance(engines, dict):
+            raw.gpu_busy_pct = gpu_busy(engines)
+            raw.sources["gpu"] = "GPU performance counters"
+        else:
+            unavailable["gpu"] = self._pdh.failed.get("gpu_engine") or "this GPU doesn't report its load"
+        mem = counters.get("gpu_mem")
+        if isinstance(mem, dict) and mem:
+            raw.gpu_mem_used = int(sum(max(0.0, float(v)) for v in mem.values()))
+        # The power state is checked right before every query (about 0.4 ms): a query that lands
+        # just after the GPU fell asleep would wake it, and the next check would find it awake.
         try:
-            import pythoncom
-            import win32com.client
-
-            pythoncom.CoInitialize()
-            try:
-                wmi = win32com.client.GetObject(r"winmgmts:\\.\root\LibreHardwareMonitor")
-                rows = wmi.ExecQuery("SELECT Name, Value, SensorType FROM Sensor WHERE SensorType='Temperature'")
-                temps = [float(r.Value) for r in rows if "cpu" in str(r.Name).lower() or "package" in str(r.Name).lower()]
-                if temps:
-                    self._temp_value = max(temps)
-                    return self._temp_value
-            except Exception:
-                pass
-            if self.is_admin():
-                try:
-                    wmi = win32com.client.GetObject(r"winmgmts:\\.\root\wmi")
-                    rows = wmi.ExecQuery("SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature")
-                    temps = [r.CurrentTemperature / 10.0 - 273.15 for r in rows]
-                    temps = [t for t in temps if 10 < t < 125]
-                    if temps:
-                        self._temp_value = max(temps)
-                        return self._temp_value
-                except Exception:
-                    pass
+            adapters = display_adapters()
         except Exception:
-            pass
-        self._temp_reason = (
-            "no sensor reported by Windows" if self.is_admin() else "needs admin or LibreHardwareMonitor"
-        )
-        self._temp_checked_at = now + 570.0  # don't retry for ~10 minutes
-        return None
+            adapters = []
+
+        def awake(ven_dev: str) -> bool:
+            states = [a[2] for a in adapters if ven_dev in a[0]]
+            return not states or any(st in (None, 1) for st in states)
+
+        try:
+            gpus = gpu_sensors(awake)
+        except Exception:
+            log.debug("GPU sensors unavailable", exc_info=True)
+            gpus = []
+        for g in gpus:
+            if g.vram:
+                self._vram[g.ven_dev] = g.vram
+        main = max(gpus, key=lambda g: self._vram.get(g.ven_dev, 0), default=None)  # the discrete one, if any
+        if main is None:
+            raw.gpu_name = next((a[1] for a in adapters if a[1]), None)
+        else:
+            raw.gpu_name = next((a[1] for a in adapters if main.ven_dev in a[0] and a[1]), None)
+            raw.gpu_mem_total = self._vram.get(main.ven_dev)
+            if not awake(main.ven_dev):
+                unavailable["gpu_temp"] = "the GPU is asleep to save power"
+            elif main.temp_c is not None:
+                raw.gpu_temp_c = main.temp_c
+                raw.sources["gpu_temp"] = "graphics driver"
+            if main.fan_rpm:
+                raw.fans.append(Fan("GPU fan", main.fan_rpm, main.fan_max_rpm))
+                raw.sources["fan"] = "graphics driver"
+        if raw.gpu_temp_c is None and "gpu_temp" not in unavailable:
+            unavailable["gpu_temp"] = "this GPU's driver doesn't report its temperature"
+
+    def _heat(self, raw: SystemRaw) -> None:
+        """CPU temperature and fans: LibreHardwareMonitor if running, else an ACPI zone (admin only)."""
+        now = time.monotonic()
+        if now >= self._lhm_next:
+            self._lhm_value = read_lhm()
+            self._lhm_next = now + (5.0 if self._lhm_value is not None else 600.0)
+        merge(raw, self._lhm_value)
+        if raw.temp_c is None and self.is_admin():
+            if now >= self._acpi_next:
+                self._acpi_value = _acpi_zone()
+                self._acpi_next = now + 30.0
+            if self._acpi_value is not None:
+                raw.temp_c = self._acpi_value
+                raw.sources["temp"] = ACPI
+        if raw.temp_c is None:
+            raw.unavailable["temp"] = "no sensor reported by Windows" if self.is_admin() else "needs admin on this PC"
+        if not raw.fans:
+            raw.unavailable["fan"] = "no fan sensor reported by Windows" if self.is_admin() else "needs admin on this PC"
 
     def _volumes(self) -> list[Volume]:
         now = time.monotonic()
@@ -702,6 +911,22 @@ class WindowsPlatform(Platform):
 
 
 # ---------------------------------------------------------------------- helpers
+def _acpi_zone() -> float | None:
+    """The warmest ACPI thermal zone (admin only). Below 30 °C it's a firmware placeholder, not a chip."""
+    try:
+        import pythoncom
+        import win32com.client
+
+        pythoncom.CoInitialize()
+        wmi = win32com.client.GetObject(r"winmgmts:\\.\root\wmi")
+        temps = [r.CurrentTemperature / 10.0 - 273.15 for r in wmi.ExecQuery(
+            "SELECT CurrentTemperature FROM MSAcpi_ThermalZoneTemperature")]
+    except Exception:
+        return None
+    temps = [t for t in temps if 30.0 <= t < 125.0]
+    return max(temps) if temps else None
+
+
 def _idle_seconds() -> float:
     lii = LASTINPUTINFO()
     lii.cbSize = ctypes.sizeof(LASTINPUTINFO)

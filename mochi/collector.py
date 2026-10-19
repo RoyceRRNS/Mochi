@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 from .config import Config
 from .grouping import Grouper
-from .model import Proc, Sample, derive_metrics
+from .model import Proc, Sample, SystemRaw, derive_metrics
 from .platform.base import Platform
 
 
 class Collector:
-    def __init__(self, platform: Platform, cfg: Config) -> None:
+    def __init__(self, platform: Platform, cfg: Config, augment: Callable[[SystemRaw], None] | None = None) -> None:
         self.platform = platform
         self.cfg = cfg
+        self.augment = augment      # adds readings from outside the platform (the sensor helper)
         self.ncpu = max(1, platform.cpu_count())
         self.grouper = Grouper(platform.self_pid(), platform.cmdline)
         self._prev: dict[tuple[int, float], tuple[float, int | None, int | None]] = {}
@@ -27,6 +30,8 @@ class Collector:
         raws = self.platform.read_processes()
         sysraw = self.platform.read_system()
         self.platform.describe_foreground(sysraw, raws)
+        if self.augment is not None:
+            self.augment(sysraw)
         dt = (mono - self._prev_mono) if self._prev_mono is not None else None
         max_core = self.ncpu * 100.0
         procs: list[Proc] = []

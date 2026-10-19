@@ -1,4 +1,4 @@
-"""Home: big Mochi, the weather line, three soft gauges, and the inbox."""
+"""Home: big Mochi, the weather line, three soft gauges, GPU/heat/fans, and the inbox."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ from ...model import Level
 from ...moods import LABELS, Mood
 from ..mascot import MochiWidget
 from ..theme import THEME
-from ..widgets import (Banner, Card, Chip, RiceCakes, RingGauge, SpeechBubble, button, clear_layout, hbox, label,
-                       level_chip, sky_pixmap, vbox)
+from ..widgets import (Banner, Card, Chip, RiceCakes, RingGauge, SpeechBubble, StatTile, button, clear_layout, hbox,
+                       label, level_chip, sky_pixmap, vbox)
 from .common import Page, time_ago
 
 RESPONSE_TEXT = {
@@ -25,6 +25,33 @@ RESPONSE_TEXT = {
     "action": "You took action. Thanks!",
     "dismissed": "Dismissed.",
 }
+GPU_HOT_C = 87.0      # where laptop GPUs start slowing themselves down
+GPU_WARM_C = 80.0
+
+
+def temp_state(t: float | None, warm: float, hot: float, z: float | None) -> str:
+    if t is None:
+        return "off"
+    if t >= hot:
+        return "critical"
+    if t >= warm or (z is not None and z > 3):
+        return "warning"
+    return "good"
+
+
+def short_gpu_name(name: str | None) -> str:
+    """"NVIDIA GeForce RTX 4070 Laptop GPU" -> "RTX 4070 Laptop GPU" (the full name is in the tooltip)."""
+    if not name:
+        return "GPU"
+    for junk in ("NVIDIA ", "GeForce ", "AMD ", "(R)", "(TM)", "(tm)"):
+        name = name.replace(junk, "")
+    return " ".join(name.split()) or "GPU"
+
+
+def fmt_rpm(rpm: float) -> str:
+    return f"{rpm:,.0f}"
+
+
 MOOD_FILL = {Mood.HAPPY: "good", Mood.SLEEPY: "info", Mood.PUFFY: "warning", Mood.SWEATY: "warning",
              Mood.DIZZY: "critical", Mood.GRUMPY: "critical", Mood.ZOOMIES: "info", Mood.PROUD: "accent"}
 
@@ -131,6 +158,7 @@ class HomePage(Page):
         self.mood_desc = label("Everything is within your normal.", muted=True, wrap=True)
         self.mood_desc.setAlignment(Qt.AlignCenter)
         self.bubble = SpeechBubble("I'm feeling great! Everything looks normal.")
+        hero.lay.addStretch(1)
         hero.add(self.mochi)
         hero.lay.setAlignment(self.mochi, Qt.AlignHCenter)
         hero.add(hbox(None, self.mood_chip, None))
@@ -147,7 +175,7 @@ class HomePage(Page):
         lb.addWidget(self.learn_bar)
         hero.add(self.learn_box)
         hero.lay.addStretch(1)
-        grid.addWidget(hero, 0, 0, 3, 1)
+        grid.addWidget(hero, 0, 0, 4, 1)
 
         # --- weather
         self.weather_card = Card(padding=16)
@@ -170,6 +198,23 @@ class HomePage(Page):
         gauges.add(self.activity_label)
         grid.addWidget(gauges, 1, 1)
 
+        # --- GPU, heat and fans
+        heat = Card(padding=16)
+        self.heat_title = label("GPU, heat and fans", "H3")
+        heat.add(self.heat_title)
+        tiles = QGridLayout()
+        tiles.setHorizontalSpacing(10)
+        tiles.setVerticalSpacing(10)
+        self.t_cpu_temp = StatTile("CPU temperature")
+        self.t_gpu = StatTile("GPU")
+        self.t_gpu_temp = StatTile("GPU temperature")
+        self.t_fans = StatTile("Fans")
+        for i, t in enumerate((self.t_cpu_temp, self.t_gpu_temp, self.t_gpu, self.t_fans)):
+            tiles.addWidget(t, i // 2, i % 2)
+        heat.add(tiles)
+        self.heat_card = heat
+        grid.addWidget(heat, 2, 1)
+
         # --- small facts under the gauges
         facts = QHBoxLayout()
         facts.setSpacing(18)
@@ -186,7 +231,7 @@ class HomePage(Page):
         calm.add(self.cakes)
         calm.add(self.calm_text)
         facts.addWidget(calm, 2)
-        grid.addLayout(facts, 2, 1)
+        grid.addLayout(facts, 3, 1)
         grid.setColumnStretch(0, 5)
         grid.setColumnStretch(1, 7)
 
@@ -270,6 +315,11 @@ class HomePage(Page):
         if v.primary_volume:
             m, free, fp = v.primary_volume
             lines.append(f"Disk {m} {free:.0f} GB free ({fp:.0f}%)")
+        heat = [f"CPU {v.cpu_temp:.0f} °C" if v.cpu_temp is not None else "",
+                f"GPU {v.gpu_temp:.0f} °C" if v.gpu_temp is not None else "",
+                f"fans {fmt_rpm(max(f.rpm for f in v.fans))} RPM" if v.fans else ""]
+        if any(heat):
+            lines.append(" · ".join(h for h in heat if h))
         self.bubble.setText("\n".join(lines))
         self._poke_until = time.monotonic() + 8.0
 
@@ -304,8 +354,10 @@ class HomePage(Page):
         self._gauge_cpu(v)
         self._gauge_ram(v)
         self._gauge_disk(v)
+        self._heat(v)
         idle = "you're away" if v.user_idle else f"you're {v.activity}" if v.activity not in ("other", "idle") else "you're active"
-        self.activity_label.setText(f"Compared with your normal for this hour while {idle} · sensitivity: {v.sensitivity}")
+        self.activity_label.setText(f"Compared with your normal for this hour while {idle}")
+        self.activity_label.setToolTip(f"Sensitivity: {v.sensitivity} (change it in Settings)")
         self.roast_card.setVisible(bool(v.roast))
         if v.roast:
             self.roast_text.setText(v.roast)
@@ -320,17 +372,18 @@ class HomePage(Page):
         b = v.bands.get("cpu")
         band = (b[0] - 2 * b[1], b[0] + 2 * b[1]) if b else None
         sub = f"usual {max(0, band[0]):.0f}-{band[1]:.0f}%" if band else "learning your normal"
-        self.g_cpu.set(v.cpu, f"{v.cpu:.0f}%" if v.cpu is not None else "--", sub, band, self._state(v.z.get("cpu")))
+        self.g_cpu.set(v.cpu, f"{v.cpu:.0f}%" if v.cpu is not None else "--", sub, band, self._state(v.z.get("cpu")),
+                       caption="busy")
 
     def _gauge_ram(self, v: SampleView) -> None:
         b = v.bands.get("ram")
         total = v.ram_total_gb or 1
         band = ((b[0] - 2 * b[1]) / total * 100, (b[0] + 2 * b[1]) / total * 100) if b else None
-        sub = f"usual {max(0, b[0] - 2 * b[1]):.1f}-{b[0] + 2 * b[1]:.1f} GB" if b else f"of {total:.0f} GB"
+        sub = f"usual {max(0, b[0] - 2 * b[1]):.1f}-{b[0] + 2 * b[1]:.1f} GB" if b else "learning your normal"
         state = self._state(v.z.get("ram"))
         if v.ram_used_pct >= 90:
             state = "critical"
-        self.g_ram.set(v.ram_used_pct, f"{v.ram_used_gb:.1f} GB", sub, band, state)
+        self.g_ram.set(v.ram_used_pct, f"{v.ram_used_gb:.1f} GB", sub, band, state, caption=f"of {total:.1f} GB")
 
     def _gauge_disk(self, v: SampleView) -> None:
         if not v.primary_volume:
@@ -338,7 +391,73 @@ class HomePage(Page):
             return
         mount, free, fp = v.primary_volume
         state = "critical" if fp < 10 else "warning" if fp < 20 else "good"
-        self.g_disk.set(100 - fp, f"{free:.0f} GB", f"free on {mount.rstrip(chr(92))}", None, state)
+        drive = mount.rstrip(chr(92))
+        self.g_disk.set(100 - fp, f"{100 - fp:.0f}%", f"{free:.0f} GB free on {drive}", None, state, caption="full")
+
+    # ----------------------------------------------------------- heat card
+    def _band_text(self, v: SampleView, metric: str, unit: str, digits: int = 0) -> str:
+        b = v.bands.get(metric)
+        if not b:
+            return "learning your normal"
+        lo, hi = max(0.0, b[0] - 2 * b[1]), b[0] + 2 * b[1]
+        return f"usual {lo:,.{digits}f}-{hi:,.{digits}f}{unit}"
+
+    def _needs_helper(self, v: SampleView, key: str) -> bool:
+        helper = self.ctx.engine.sensor_helper
+        return (helper is not None and helper.state in ("off", "declined", "failed")
+                and "admin" in v.unavailable.get(key, ""))
+
+    def _turn_on_sensors(self) -> None:
+        self.ctx.engine.set_sensor_helper(True)
+        self.ctx.toast("Windows will ask for permission. After that, CPU temperature and fans show up here.")
+
+    def _missing(self, tile: StatTile, v: SampleView, key: str) -> None:
+        reason = v.unavailable.get(key) or "not reported"
+        offer = self._needs_helper(v, key)
+        if offer:
+            reason = "Needs admin on this PC. Windows asks you first."
+        tile.set("--", reason[:1].upper() + reason[1:], "off")
+        tile.set_action("Turn on" if offer else None, self._turn_on_sensors)
+
+    def _heat(self, v: SampleView) -> None:
+        tj = self.ctx.engine.cfg.tjmax_c
+        if v.cpu_temp is None:
+            self._missing(self.t_cpu_temp, v, "temp")
+        else:
+            self.t_cpu_temp.set(f"{v.cpu_temp:.0f} °C", self._band_text(v, "temp", " °C"),
+                                temp_state(v.cpu_temp, tj - 25.0, tj - 10.0, v.z.get("temp")))
+            self.t_cpu_temp.set_action(None)
+        if v.gpu_temp is None:
+            self._missing(self.t_gpu_temp, v, "gpu_temp")
+        else:
+            self.t_gpu_temp.set(f"{v.gpu_temp:.0f} °C", self._band_text(v, "gpu_temp", " °C"),
+                                temp_state(v.gpu_temp, GPU_WARM_C, GPU_HOT_C, v.z.get("gpu_temp")))
+            self.t_gpu_temp.set_action(None)
+        self.t_gpu.title_label.setText(short_gpu_name(v.gpu_name))
+        self.t_gpu.title_label.setToolTip(v.gpu_name or "")
+        if v.gpu_busy is None:
+            self._missing(self.t_gpu, v, "gpu")
+        else:
+            bits = []
+            if v.gpu_mem_used_gb is not None:
+                bits.append(f"{v.gpu_mem_used_gb:.1f} of {v.gpu_mem_total_gb:.0f} GB memory" if v.gpu_mem_total_gb
+                            else f"{v.gpu_mem_used_gb:.1f} GB memory")
+            if v.gpu_power_w is not None:
+                bits.append(f"{v.gpu_power_w:.0f} W")
+            sub = "\n".join(s for s in (" · ".join(bits), self._band_text(v, "gpu", "%")) if s)
+            z = v.z.get("gpu")
+            self.t_gpu.set(f"{v.gpu_busy:.0f}% busy", sub, "warning" if z is not None and z > 3 else "good",
+                           bar=v.gpu_busy / 100.0)
+        if not v.fans:
+            self._missing(self.t_fans, v, "fan")
+        else:
+            top = max(v.fans, key=lambda f: f.rpm)
+            each = " · ".join(f"{f.label} {fmt_rpm(f.rpm)}" for f in v.fans) if len(v.fans) > 1 else ""
+            sub = "\n".join(s for s in (each, self._band_text(v, "fan", " RPM")) if s)
+            value = f"{fmt_rpm(top.rpm)} RPM" if top.rpm > 0 else "Stopped (quiet)"
+            self.t_fans.set(value, sub, "warning" if (top.pct or 0) >= 90 else "good",
+                            bar=top.pct / 100.0 if top.pct is not None else None)
+            self.t_fans.set_action(None)
 
     def on_nerd(self, on: bool) -> None:
         self.refresh_inbox()

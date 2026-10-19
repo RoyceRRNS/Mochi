@@ -32,6 +32,7 @@ python -m venv .venv
 | `python -m mochi --demo` | Demo profile: much shorter waits before alerts, clearly labelled in the UI |
 | `python -m mochi --simulate` | The full UI on simulated data (a memory hog appears every 10 minutes) |
 | `python -m mochi --headless --seconds 60` | Engine only, no UI (used for overhead measurements) |
+| `python -m mochi --quit` | Ask the running Mochi to save everything and quit (stops the sensor helper too) |
 
 Data lives in `%LOCALAPPDATA%\Mochi\<profile>` (database, config, logs). It never goes
 into the repo, and Mochi never connects to the internet.
@@ -53,7 +54,8 @@ benchmarks run in a separate process.
 
 | Module | Responsibility |
 | --- | --- |
-| `mochi/platform/windows.py` | All processes from one `NtQuerySystemInformation` call; paging, commit, disk busy/latency, run queue and throttling from performance counters (PDH); battery drain from `CallNtPowerInformation`; idle time, foreground app and full-screen state via ctypes |
+| `mochi/platform/windows.py` | All processes from one `NtQuerySystemInformation` call; paging, commit, disk busy/latency, run queue, throttling and GPU load/memory from performance counters (PDH); GPU temperature from the driver via D3DKMT; battery drain from `CallNtPowerInformation`; idle time, foreground app and full-screen state via ctypes |
+| `mochi/sensors.py`, `sensor_helper.py` | CPU temperature and fan speeds from LibreHardwareMonitor or Lenovo firmware sensors; the optional elevated, read-only helper and the JSON feed it writes |
 | `mochi/collector.py`, `grouping.py` | Per-process rates; processes grouped into apps (all `chrome.exe` = one app; scripts named, e.g. `python.exe (memory_hog.py)`; Mochi and its children tagged as self) |
 | `mochi/activity.py`, `buckets.py` | Activity from the foreground app (editable mapping), one shared idle definition, 48 time slots, fallback buckets |
 | `mochi/baseline.py` | EWMA mean/variance, trust rule (>= 30 samples on >= 2 days), contamination guard, 20-minute delayed commit, "new normal" relearning |
@@ -79,11 +81,31 @@ Tests run daily for the first 14 days, then weekly, only while you're away and p
 Because the score compares the PC with its own early runs, a PC that was already slow when
 Mochi was installed still scores 100; "Re-baseline" starts a new reference after an upgrade.
 
+### Temperatures, GPU and fans
+
+| Reading | Source | Admin? |
+| --- | --- | --- |
+| GPU busy | `\GPU Engine(*)\Utilization Percentage`: each engine's share summed over processes, busiest engine shown (the same number as Task Manager) | No |
+| GPU memory | `\GPU Adapter Memory(*)\Dedicated Usage` | No |
+| GPU temperature (and a GPU fan on desktops) | The performance data the graphics driver gives Windows (`D3DKMTQueryAdapterInfo`, what Task Manager shows), asked only while the GPU is awake: SetupAPI reports each adapter's power state without touching it, so a sleeping laptop GPU is never woken. NVIDIA's NVML was tried first but costs 19 MB of memory | No |
+| CPU temperature, fan speeds | LibreHardwareMonitor's WMI sensors if it's running; otherwise Lenovo's `LENOVO_GAMEZONE_DATA` firmware methods | Lenovo: yes |
+
+Windows only lets administrators call the Lenovo methods, so Settings > Temperatures and fans
+can start `mochi.sensor_helper` with admin rights (Windows asks first, each time Mochi starts).
+The helper only reads sensors, writes them to `sensors.json` in the profile folder every 3 s,
+and exits when Mochi exits or writes `sensors.stop`. ACPI thermal zones below 30 °C are firmware
+placeholders (27.9 °C on many laptops) and are never shown as the CPU temperature.
+
+GPU busy, GPU temperature and fan speed learn a "your normal" band like the other metrics and
+appear on Home and the Timeline, but they never raise alerts on their own. The CPU temperature
+from the helper does feed the existing overheating and throttling alerts.
+
 ## OS concepts covered
 
 | Module of the syllabus | Where it appears in Mochi |
 | --- | --- |
-| OS services, system calls | `NtQuerySystemInformation`, PDH counters, `CallNtPowerInformation`, `GetLastInputInfo`, `SHQueryUserNotificationState`, WinVerifyTrust |
+| OS services, system calls | `NtQuerySystemInformation`, PDH counters, `CallNtPowerInformation`, `GetLastInputInfo`, `SHQueryUserNotificationState`, WinVerifyTrust, `D3DKMTQueryAdapterInfo`, SetupAPI device power state |
+| Protection rings, privilege | The optional admin helper: least privilege for Mochi itself, a separate elevated process that only reads sensors, consent through UAC, no writes through links or junctions |
 | Processes and threads | Per-process attribution by (PID, start time), process trees and app grouping, five cooperating threads |
 | Scheduling | Run-queue length, context switches (OS fact of the day), "let it run slower" = lowering process priority |
 | Concurrency | Producer-consumer bounded queue, locks around baselines, supervisor restarting dead threads, single-instance lock |
@@ -130,14 +152,14 @@ Measured on the development laptop (Intel Core i9-14900HX, 32 threads, 32 GB, Wi
 
 ## Tests
 
-453 tests, all passing:
+580 tests, all passing:
 
 | Suite | Tests | What it covers |
 | --- | --- | --- |
-| `tests/unit` | 320 | Every module, positive and negative cases (maths, rules, lifecycle, storage, privacy, contrast) |
-| `tests/e2e/test_scenarios.py` | 30 | Full pipeline on a warmed-up simulated PC: every fault in the test table, feedback, quiet modes, learning mode, restart, sleep, clock changes, benchmarks, check-up, quirks |
-| `tests/e2e/test_real_machine.py` | 19 | Real Windows readings, real process actions, CLI, single instance, hard kill, real benchmark, light capped fault injection, overhead |
-| `tests/ui` | 84 | Widgets, mascot, tray, popups, every screen, keyboard and theme handling, full user journeys |
+| `tests/unit` | 410 | Every module, positive and negative cases (maths, rules, lifecycle, storage and migrations, sensors and the helper, privacy, contrast) |
+| `tests/e2e/test_scenarios.py` | 33 | Full pipeline on a warmed-up simulated PC: every fault in the test table, feedback, quiet modes, learning mode, restart, sleep, clock changes, benchmarks, check-up, quirks, CPU temperature and fans from the helper, GPU-heavy gaming |
+| `tests/e2e/test_real_machine.py` | 25 | Real Windows readings (including GPU and sensors), the real helper process, process actions, CLI, single instance, hard kill, real benchmark, light capped fault injection, overhead |
+| `tests/ui` | 112 | Widgets, mascot, tray, popups, every screen (including the GPU, heat and fans tiles), keyboard and theme handling, full user journeys |
 
 ```bash
 .venv\Scripts\python -m pytest
@@ -163,9 +185,12 @@ The real-machine tests put light, capped load on the PC (about 30 s of one CPU c
 
 ## Known limitations
 
-- CPU temperature and SMART details need admin rights or LibreHardwareMonitor; without
-  them Mochi shows "unavailable (needs admin)", never 0.
-- GPU, network and per-app power use are not monitored.
+- CPU temperature and fan speeds need LibreHardwareMonitor or, on Lenovo laptops, the optional
+  admin helper; SMART details need admin. Without them Mochi shows "unavailable (reason)", never 0.
+- GPU temperature needs a driver that reports it to Windows (recent NVIDIA and AMD drivers do;
+  many integrated GPUs don't). GPU power isn't shown. Lenovo fan readings are labelled Fan 1 and
+  Fan 2, because the firmware doesn't say which fan cools what.
+- GPU readings don't raise alerts yet, and network and per-app power use are not monitored.
 - Windows' Do Not Disturb is detected only through the "quiet time" notification state.
 - The Linux/macOS adapter (`platform/generic.py`) is best effort and untested on those systems.
 - The real week-long false-alarm study is still to be done.

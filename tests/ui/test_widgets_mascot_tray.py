@@ -260,3 +260,17 @@ def test_late_background_result_for_a_closed_window_is_dropped(qtbot, sim):
     bridge.run_async(lambda: 1 / 0, None, got.append)
     qtbot.waitUntil(lambda: bool(got), timeout=2000)
     assert isinstance(got[0], ZeroDivisionError)
+
+
+def test_gauge_text_always_fits_inside_the_ring(qtbot):
+    from PySide6.QtGui import QFontMetricsF
+
+    g = RingGauge("Memory")
+    qtbot.addWidget(g)
+    g.resize(150, 190)
+    for text in ("3%", "11.7 GB", "1023.9 GB", "--"):
+        f = g._fit(text, 80, 24, 13, 800, tabular=True)
+        assert QFontMetricsF(f).horizontalAdvance(text) <= 80 or f.pixelSize() == 13
+    g.set(42, "11.7 GB", "usual 3.4-7.2 GB", state="warning", caption="of 31.8 GB")
+    assert "of 31.8 GB" in g.accessibleDescription()
+    assert non_blank(img(g))

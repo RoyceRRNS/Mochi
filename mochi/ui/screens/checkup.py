@@ -46,6 +46,16 @@ class CheckupPage(Page):
         self.rebase_btn = button("Re-baseline", "Ghost", "Start a new reference, e.g. after a hardware upgrade",
                                  self.rebaseline)
         run_card.add(hbox(self.run_btn, self.bench_btn, self.cancel_btn, None, self.rebase_btn))
+        self.preview = QWidget()
+        prev = QGridLayout(self.preview)
+        prev.setContentsMargins(0, 6, 0, 0)
+        prev.setHorizontalSpacing(24)
+        prev.setVerticalSpacing(6)
+        for i, text in enumerate(("Free disk space and biggest folders", "Disk health", "Programs that start with Windows",
+                                  "CPU temperature and throttling", "Background apps while you're away",
+                                  "Programs with growing memory", "Battery health (laptops)", "Speed test and Health Score")):
+            prev.addWidget(label(f"\u2022  {text}", muted=True), i % 4, i // 4)
+        run_card.add(self.preview)
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress.hide()
@@ -132,20 +142,22 @@ class CheckupPage(Page):
         latest, ref, score = h["latest"], h["reference"], h["score"]
         if score is None:
             runs = h["runs"]
-            self.score.set(0, "--", "still learning")
+            self.score.set(0, "--", "still learning", caption="out of 100")
             self.score_note.setText(f"I need {max(0, 3 - runs)} more speed test{'s' if 3 - runs != 1 else ''} before I can "
                                     f"compare. Tests run daily for the first two weeks while you're away and plugged in."
                                     if runs < 3 else "Not enough matching runs yet (same power source and power mode).")
         else:
             state = "good" if score >= 90 else "warning" if score >= 80 else "critical"
-            self.score.set(score, f"{score:.0f}", "out of 100", None, state)
+            self.score.set(score, f"{score:.0f}", "", None, state,
+                           caption="out of 100")
             self.score_note.setText("Compared with this PC's own early speed tests. 100 means as fast as it used to be.")
         clear_layout(self.bench_grid)
+        if latest is None:
+            self.bench_note.setText("No speed test yet. It takes about 10 seconds and compares CPU, memory and disk "
+                                    "speed with this PC's own early runs.")
+            return
         for c, head in enumerate(("Test", "Now", "Usual", "Speed")):
             self.bench_grid.addWidget(label(head, muted=True), 0, c)
-        if latest is None:
-            self.bench_note.setText("No speed test yet. It takes about 10 seconds.")
-            return
         for r, t in enumerate(WEIGHTS, start=1):
             cur = getattr(latest, t)
             usual = ref.get(t) if ref else None
@@ -163,6 +175,7 @@ class CheckupPage(Page):
     # ----------------------------------------------------------------- runs
     def _busy(self, on: bool, text: str = "") -> None:
         self.running = on
+        self.preview.setVisible(not on)
         self.run_btn.setEnabled(not on)
         self.bench_btn.setEnabled(not on)
         self.cancel_btn.setVisible(on)

@@ -126,7 +126,11 @@ class TestHome:
     def test_gauges_mood_and_learning(self, ctrl, sim):
         home = ctrl.window.pages["home"]
         ctrl.window.on_sample(sim.engine.latest)
-        assert home.g_cpu.value_text.endswith("%") and "GB" in home.g_ram.value_text and "GB" in home.g_disk.value_text
+        assert home.g_cpu.value_text.endswith("%") and home.g_cpu.caption == "busy"
+        assert "GB" in home.g_ram.value_text and home.g_ram.caption.startswith("of ")
+        # the disk ring shows how full the drive is; the line under it says how much is free
+        assert home.g_disk.value_text.endswith("%") and home.g_disk.caption == "full"
+        assert "GB free on C:" in home.g_disk.sub
         assert home.mood_chip.text() == "Happy"
         assert "Compared with your normal" in home.activity_label.text()
 

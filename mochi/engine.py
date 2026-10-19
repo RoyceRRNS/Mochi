@@ -38,12 +38,13 @@ from .detector import Detector, DetectorResult
 from .diagnosis import Action, DiagContext, DiagnosisEngine
 from .feedback import FeedbackManager, Suppression
 from .folderscan import FolderScanner, ScanResult, scan as folder_scan
-from .model import GB, MB, App, Battery, Level, Sample
+from .model import GB, MB, App, Battery, Fan, Level, Sample, SystemRaw
 from .moods import LABELS, SPEECH, Mood, MoodEngine, MoodInputs, conditions
 from .paths import Paths
 from .platform.base import Platform
 from .quirks import (BootTracker, FeedTracker, calm_streak, diary, evaluate_achievements, os_fact, records, roast,
                      weather)
+from .sensors import FEED_NAME, SensorFeed, SensorHelper, merge
 from .startup_tracker import Launch, StartupWatcher, several_apps_slow, slow_apps
 from .storage import Storage
 from .trends import DiskTrend, LeakTracker, RunawayTracker
@@ -111,6 +112,15 @@ class SampleView:
     snoozed_until: float
     demo: bool
     sensitivity: str
+    cpu_temp: float | None = None
+    gpu_busy: float | None = None
+    gpu_temp: float | None = None
+    gpu_mem_used_gb: float | None = None
+    gpu_mem_total_gb: float | None = None
+    gpu_power_w: float | None = None
+    gpu_name: str | None = None
+    fans: list[Fan] = field(default_factory=list)
+    sources: dict[str, str] = field(default_factory=dict)
 
     @property
     def mood_label(self) -> tuple[str, str]:
@@ -125,7 +135,8 @@ class Engine:
     def __init__(self, platform: Platform, paths: Paths, cfg: Config | None = None, storage: Storage | None = None,
                  *, threaded: bool = True, clock=None, tz=None, start_threads: bool = True,
                  startup_watcher: bool | None = None, bench_scale: float = 1.0, bench_disk_mb: int | None = None,
-                 autostart: Autostart | None = None, profile: str = "default") -> None:
+                 autostart: Autostart | None = None, profile: str = "default",
+                 sensor_helper: SensorHelper | None = None) -> None:
         self.paths = paths.ensure()
         self.platform = platform
         self.clock = clock or SystemClock()
@@ -145,7 +156,11 @@ class Engine:
         self.baselines = BaselineStore(self.cfg)
         self.baselines.load_rows(self.storage.load_baselines())
         self.detector = Detector(self.cfg, self.baselines)
-        self.collector = Collector(platform, self.cfg)
+        self.sensor_feed = SensorFeed(self.paths.root / FEED_NAME)
+        if sensor_helper is None and platform.name == "windows":
+            sensor_helper = SensorHelper(self.paths.root, platform.is_admin)
+        self.sensor_helper = sensor_helper
+        self.collector = Collector(platform, self.cfg, augment=self._augment)
         self.leaks = LeakTracker(self.cfg)
         self.disk_trend = DiskTrend(self.cfg)
         self.runaway = RunawayTracker(self.cfg)
@@ -191,6 +206,13 @@ class Engine:
         self.latest: SampleView | None = None
         self.current_mood = Mood.HAPPY
         self.notices: dict[str, Notice] = {}
+        if getattr(self.storage, "recovered", None) is not None:
+            rep = self.storage.recovered
+            lost = ", ".join(sorted(rep.damaged)) or "nothing"
+            self.notices["db_recovered"] = Notice(
+                "db_recovered", self.clock.time(), "I patched up my notebook",
+                f"My database file was damaged, so I copied everything I could still read ({rep.rows} rows) into a "
+                f"fresh one. Lost: {lost}. The damaged file is kept next to it.")
         self.health = HealthScore(self.cfg.bench_ref_runs)
         self.bench = BenchmarkRunner(self.cfg, paths.tmp, scale=bench_scale, disk_mb=bench_disk_mb)
         self.scheduler = BenchmarkScheduler(self.cfg)
@@ -228,6 +250,8 @@ class Engine:
         self._spawn("collector", self._collector_loop)
         self._spawn("processing", self._processing_loop)
         self._spawn("supervisor", self._supervisor_loop)
+        if self.sensor_helper is not None and (self.base_cfg.sensor_helper or self.platform.is_admin()):
+            self.sensor_helper.start(self.platform.self_pid())
         if self._want_startup_watcher and self.startup_watcher is None:
             self.startup_watcher = StartupWatcher(self._on_launch, self.platform.self_pid(), self.platform.boot_time(),
                                                   self._launched_since_boot, self.cfg.startup_settle_pct)
@@ -248,12 +272,38 @@ class Engine:
             t.join(max(0.05, timeout / 3))
         if self.startup_watcher:
             self.startup_watcher.stop()
+        if self.sensor_helper is not None:
+            self.sensor_helper.stop()
         with self.lock:
             self.baselines.commit_all()
             self.storage.save_baselines(self.baselines.rows())
             self.storage.set_meta("snoozed_until", str(self.quiet.snoozed_until))
         self.storage.close(max(0.2, timeout - (time.monotonic() - t0)))
         return time.monotonic() - t0
+
+    def _augment(self, raw: SystemRaw) -> None:
+        """Add the sensor helper's readings, and say how to get the ones still missing."""
+        merge(raw, self.sensor_feed.read(self.clock.time()))
+        helper = self.sensor_helper
+        if helper is None:
+            return
+        for key in ("temp", "fan"):
+            reason = raw.unavailable.get(key)
+            if reason is None or not reason.startswith("needs admin"):
+                continue
+            if helper.state == "off":
+                continue    # the screens offer a "Turn on" button next to this reason
+            if helper.state == "asking":
+                raw.unavailable[key] = "waiting for Windows to give permission"
+            elif helper.state == "running":
+                raw.unavailable[key] = ("the sensor helper is starting" if helper.age() < 30.0
+                                        else "the sensor helper isn't reporting (this PC may not share it)")
+            else:
+                raw.unavailable[key] = helper.message.rstrip(".") or reason
+
+    def set_sensor_helper(self, on: bool) -> list[str]:
+        """Turn the elevated sensor helper on or off (Windows asks before it starts)."""
+        return self.update_config(sensor_helper=bool(on))
 
     def _collector_loop(self) -> None:
         interval = self.cfg.sample_interval_s
@@ -485,6 +535,11 @@ class Engine:
             late_ms=s.late_ms, drops=self.drops, badge=self.alerts.badge_count, roast=roast_text,
             user_idle=user_idle, fullscreen=sy.fullscreen, snoozed_until=self.quiet.snoozed_until,
             demo=self.base_cfg.demo_mode, sensitivity=self.cfg.sensitivity_name,
+            cpu_temp=sy.temp_c, gpu_busy=sy.gpu_busy_pct, gpu_temp=sy.gpu_temp_c,
+            gpu_mem_used_gb=sy.gpu_mem_used / GB if sy.gpu_mem_used is not None else None,
+            gpu_mem_total_gb=sy.gpu_mem_total / GB if sy.gpu_mem_total else None,
+            gpu_power_w=sy.gpu_power_w, gpu_name=sy.gpu_name, fans=[copy.copy(f) for f in sy.fans],
+            sources=dict(sy.sources),
         )
 
     # ============================================================ notices
@@ -588,6 +643,13 @@ class Engine:
                     self.autostart.apply(bool(new.autostart))
                 except OSError as exc:
                     res.warnings.append(f"Couldn't change start-at-sign-in ({exc}).")
+            if "sensor_helper" in changes and self.sensor_helper is not None:
+                if new.sensor_helper:
+                    self.sensor_helper.start(self.platform.self_pid())
+                elif not self.platform.is_admin():
+                    self.sensor_helper.stop()
+            elif "sensor_helper" in changes and new.sensor_helper:
+                res.warnings.append("CPU temperature and fans through the helper are only available on Windows.")
             self.base_cfg = new
             self.cfg = new.effective()
             for part in (self.baselines, self.feedback, self.alerts, self.leaks, self.disk_trend, self.runaway,

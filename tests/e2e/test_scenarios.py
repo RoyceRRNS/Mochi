@@ -12,11 +12,12 @@ import socket
 import pytest
 
 from mochi.config import Config
-from mochi.model import GB, Battery, Level, Volume
+from mochi.model import GB, WATCH_METRICS, Battery, Fan, Level, Volume
 from mochi.moods import Mood
 from mochi.platform.base import FileInfo
 from mochi.platform.fake import FakeProc, local_ts
 from mochi.replay import Simulation, normal_use
+from mochi.sensors import FEED_NAME, LENOVO, SensorReading
 
 from .conftest import TEST_START, gaming, idle_time
 
@@ -194,6 +195,60 @@ def test_thermal_throttling(warm):
     assert took is not None and took <= 3 * 60
     d = first_episode(warm, "throttling").diagnosis
     assert "overheating" in d.cause and "55%" in d.cause and "97" in d.cause and "vents" in d.tip
+
+
+# ------------------------------------------- CPU temperature, GPU and fans
+def helper_feed(sim, **kw):
+    """What the elevated sensor helper writes every few seconds (before each sample)."""
+    def write(_t):
+        d = dict(ts=sim.clock.ts + sim.interval, source=LENOVO, cpu_temp=62.0, gpu_temp=None,
+                 fans=[Fan("Fan 1", 2400, 5400), Fan("Fan 2", 2500, 5400)])
+        d.update(kw)
+        (sim.paths.root / FEED_NAME).write_text(SensorReading(**d).to_json(), encoding="utf-8")
+    return write
+
+
+def test_temperature_timeline_from_the_helper(warm):
+    """The CPU temperature timeline fills in once the helper reports, and stops when it does."""
+    assert warm.engine.latest.cpu_temp is None and "temp" in warm.engine.latest.unavailable
+    run_until(warm, lambda: False, 10 * 60, step_cb=helper_feed(warm))
+    v = warm.engine.latest
+    assert v.cpu_temp == 62.0 and v.sources["temp"] == LENOVO and [f.rpm for f in v.fans] == [2400, 2500]
+    rows = warm.engine.timeline("temp", 3600)["rows"]
+    assert sum(1 for r in rows if r[1] == 62.0) >= 115
+    fans = warm.engine.timeline("fan", 3600)["rows"]
+    assert {r[1] for r in fans if r[1] is not None} == {2500}
+    (warm.paths.root / FEED_NAME).unlink()                 # the helper quit
+    warm.run(30)
+    assert warm.engine.latest.cpu_temp is None and warm.engine.latest.unavailable["temp"]
+    assert warm.alert_events() == []
+
+
+def test_overheating_reported_through_the_helper(warm):
+    warm.platform.add(FakeProc("render.exe", 7500, 1000, cpu_core=700.0, private_mb=900, create_time=warm.clock.ts))
+    warm.platform.set(perf_limit_pct=55.0)
+    feed = helper_feed(warm, cpu_temp=97.0, fans=[Fan("Fan 1", 5300, 5400), Fan("Fan 2", 5350, 5400)])
+    took = run_until(warm, lambda: first_episode(warm, "throttling") is not None, 4 * 60, step_cb=feed)
+    assert took is not None and took <= 3 * 60
+    d = first_episode(warm, "throttling").diagnosis
+    assert "overheating" in d.cause and "97" in d.cause
+    v = warm.engine.latest
+    assert v.mood == Mood.SWEATY and max(f.rpm for f in v.fans) == 5350
+
+
+def test_gpu_heavy_gaming_is_recorded_but_never_alerts(warm):
+    warm.jump_to(local_ts(2026, 10, 16, 20, 0, 0))
+    gaming(warm)
+    warm.platform.set(gpu_busy_pct=99.0, gpu_temp_c=86.0, gpu_power_w=110.0, gpu_mem_used_gb=7.5, gpu_mem_total_gb=8.0,
+                      gpu_name="NVIDIA GeForce RTX 4070 Laptop GPU")
+    run_until(warm, lambda: False, 20 * 60, step_cb=helper_feed(warm, fans=[Fan("Fan 1", 5200, 5400)]))
+    assert not [e for e in warm.alert_events() if set(e.episode.metrics) & set(WATCH_METRICS)]
+    v = warm.engine.latest
+    assert (v.gpu_busy, v.gpu_temp, v.gpu_power_w) == (99.0, 86.0, 110.0) and v.gpu_mem_used_gb == 7.5
+    for metric, value in (("gpu", 99.0), ("gpu_temp", 86.0), ("fan", 5200)):
+        rows = warm.engine.timeline(metric, 3600)["rows"]
+        assert max(r[1] for r in rows if r[1] is not None) == value
+    assert warm.engine.storage.scalar("SELECT MAX(gpu_power) FROM samples") == 110.0
 
 
 def test_battery_draining_fast(warm):

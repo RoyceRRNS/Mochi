@@ -60,6 +60,7 @@ def button(text: str, kind: str = "", tip: str = "", on_click=None, icon_name: s
         b.setToolTip(tip)
     b.setAccessibleName(text or tip)
     b.setCursor(Qt.PointingHandCursor)
+    b.setFocusPolicy(Qt.TabFocus)
     if icon_name:
         b.setIcon(icon(icon_name))
         b.setIconSize(QSize(18, 18))
@@ -148,62 +149,83 @@ class RingGauge(QWidget):
     def __init__(self, title: str, parent: QWidget | None = None, size: int = 132) -> None:
         super().__init__(parent)
         self.title = title
-        self.value = 0.0          # 0..100
+        self.value = 0.0          # 0..100: how full the ring is
         self.value_text = "--"
-        self.sub = ""
+        self.caption = ""         # a small word inside the ring, under the number
+        self.sub = ""             # one line under the title
         self.band: tuple[float, float] | None = None
         self.state = "good"       # good | warning | critical | info
         self._size = size
-        self.setMinimumSize(size, size + 34)
+        self.setMinimumSize(size, size + 52)
         self.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Fixed)
         self.setAccessibleName(title)
 
     def sizeHint(self) -> QSize:
-        return QSize(self._size + 20, self._size + 40)
+        return QSize(self._size + 24, self._size + 52)
 
     def set(self, value: float | None, text: str, sub: str = "", band: tuple[float, float] | None = None,
-            state: str = "good") -> None:
+            state: str = "good", caption: str = "") -> None:
         self.value = max(0.0, min(100.0, value or 0.0))
-        self.value_text, self.sub, self.band, self.state = text, sub, band, state
-        self.setAccessibleDescription(f"{self.title}: {text}. {sub}")
-        self.setToolTip(f"{self.title}: {text}\n{sub}")
+        self.value_text, self.sub, self.band, self.state, self.caption = text, sub, band, state, caption
+        self.setAccessibleDescription(f"{self.title}: {text} {caption}. {sub}".replace("  ", " "))
+        self.setToolTip(f"{self.title}: {text} {caption}\n{sub}".replace("  ", " "))
         self.update()
+
+    def _fit(self, text: str, max_w: float, start: int, low: int, weight: int, tabular: bool = False):
+        from PySide6.QtGui import QFontMetricsF
+
+        for px in range(start, low - 1, -1):
+            f = THEME.font(px, weight, tabular=tabular)
+            if QFontMetricsF(f).horizontalAdvance(text) <= max_w:
+                return f
+        return THEME.font(low, weight, tabular=tabular)
 
     def paintEvent(self, _e) -> None:
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         pal = THEME.palette
-        s = min(self.width(), self._size)
-        rect = QRectF((self.width() - s) / 2 + 10, 8, s - 20, s - 20)
-        track = QPen(QColor(pal.surface_alt), 14, Qt.SolidLine, Qt.RoundCap)
-        p.setPen(track)
+        d = float(min(self.width() - 16, self._size))       # ring diameter
+        thick = max(9.0, round(d * 0.085))
+        cx = self.width() / 2
+        rect = QRectF(cx - d / 2 + thick / 2, 4 + thick / 2, d - thick, d - thick)
+        # Track: one soft ring, open at the bottom.
+        p.setPen(QPen(QColor(pal.surface_alt), thick, Qt.SolidLine, Qt.RoundCap))
         p.drawArc(rect, 225 * 16, -270 * 16)
-        if self.band:
-            lo, hi = (max(0.0, min(100.0, v)) for v in self.band)
-            band_pen = QPen(QColor(pal.good_strong), 3, Qt.SolidLine, Qt.RoundCap)
-            p.setPen(band_pen)
-            outer = rect.adjusted(-11, -11, 11, 11)
-            p.drawArc(outer, int((225 - lo * 2.7) * 16), int(-(hi - lo) * 2.7 * 16) or -16)
+        # Value: ONE clean arc in the state colour (>= 3:1 against the card).
         color = {"good": pal.good_strong, "warning": pal.warning_strong, "critical": pal.critical_strong,
                  "info": pal.info_strong}.get(self.state, pal.good_strong)
-        fill = {"good": pal.good, "warning": pal.warning, "critical": pal.critical, "info": pal.info}.get(self.state, pal.good)
-        p.setPen(QPen(QColor(fill), 14, Qt.SolidLine, Qt.RoundCap))
-        p.drawArc(rect, 225 * 16, int(-self.value * 2.7 * 16))
-        p.setPen(QPen(QColor(color), 3, Qt.SolidLine, Qt.RoundCap))
-        p.drawArc(rect.adjusted(7, 7, -7, -7), 225 * 16, int(-self.value * 2.7 * 16))
+        if self.value > 0.5:
+            p.setPen(QPen(QColor(color), thick, Qt.SolidLine, Qt.RoundCap))
+            p.drawArc(rect, 225 * 16, int(-self.value * 2.7 * 16))
+        # Number (shrunk to fit inside the ring) and its caption.
+        inner = d - 2 * thick - 12
         p.setPen(QColor(pal.text))
-        p.setFont(THEME.font(22, 800, tabular=True))
-        p.drawText(rect, Qt.AlignCenter, self.value_text)
-        p.setFont(THEME.font(13, 700))
-        p.drawText(QRectF(0, rect.bottom() - 8, self.width(), 20), Qt.AlignHCenter, self.title)
+        p.setFont(self._fit(self.value_text, inner * 0.92, 24, 13, 800, tabular=True))
+        num_box = QRectF(rect.x(), rect.center().y() - 18, rect.width(), 28)
+        if not self.caption:
+            num_box.moveTop(rect.center().y() - 14)
+        p.drawText(num_box, Qt.AlignCenter, self.value_text)
+        if self.caption:
+            p.setPen(QColor(pal.text_muted))
+            p.setFont(self._fit(self.caption, inner * 0.92, 12, 10, 600))
+            p.drawText(QRectF(rect.x(), rect.center().y() + 10, rect.width(), 18), Qt.AlignHCenter, self.caption)
+        # Title and one line under the whole ring, never on it.
+        y = 4 + d + 6
+        p.setPen(QColor(pal.text))
+        p.setFont(self._fit(self.title, self.width() - 8, 14, 11, 700))
+        p.drawText(QRectF(0, y, self.width(), 20), Qt.AlignHCenter | Qt.AlignVCenter, self.title)
         p.setPen(QColor(pal.text_muted))
-        p.setFont(THEME.font(11, 600))
-        p.drawText(QRectF(0, rect.bottom() + 10, self.width(), 18), Qt.AlignHCenter, self.sub)
+        p.setFont(self._fit(self.sub, self.width() - 8, 12, 10, 600))
+        p.drawText(QRectF(0, y + 20, self.width(), 18), Qt.AlignHCenter | Qt.AlignVCenter, self.sub)
         p.end()
 
 
 class JellyBar(QWidget):
-    """A rounded 'jelly' bar. ``segments`` = [(fraction, fill token, stroke token)]."""
+    """A rounded 'jelly' bar: one continuous stacked bar, flat segments with small gaps.
+
+    ``segments`` = [(fraction, fill token, strong token)]. The strong token colours the
+    segment (>= 3:1 against the track); fill token "muted" draws a quiet grey segment.
+    """
 
     def __init__(self, parent: QWidget | None = None, height: int = 16) -> None:
         super().__init__(parent)
@@ -230,16 +252,82 @@ class JellyBar(QWidget):
         clip.addRoundedRect(r, rad, rad)
         p.setClipPath(clip)
         x = r.x()
-        for frac, fill, stroke in self.segments:
+        gap = 2.0
+        n = len(self.segments)
+        for i, (frac, fill, strong) in enumerate(self.segments):
             w = max(0.0, min(1.0, frac)) * r.width()
-            if w <= 0:
+            if w <= 0.5:
                 continue
-            seg = QRectF(x, r.y(), w, r.height())
-            p.setBrush(QColor(getattr(pal, fill)))
-            p.setPen(QPen(QColor(getattr(pal, stroke)), 1.5))
-            p.drawRoundedRect(seg.adjusted(0.75, 0.75, -0.75, -0.75), rad - 1, rad - 1)
+            if fill == "muted":
+                c = QColor(pal.text_muted)
+                c.setAlphaF(0.45)
+            else:
+                c = QColor(getattr(pal, strong))
+            p.setBrush(c)
+            # flat segments; the bar's rounded clip gives the two outer ends their curve
+            seg_w = w - (gap if i < n - 1 and w > gap * 2 else 0.0)
+            p.drawRect(QRectF(x, r.y(), seg_w, r.height()))
             x += w
         p.end()
+
+
+STATE_TOKEN = {"good": "good_strong", "warning": "warning_strong", "critical": "critical_strong",
+               "info": "info_strong", "off": "text_muted"}
+
+
+class StatTile(QFrame):
+    """One reading in a soft box: what it is, the number, one quiet line, and an optional bar or button."""
+
+    def __init__(self, title: str, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setObjectName("Tile")
+        self.title = title
+        self.state = "off"
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 12, 14, 12)
+        lay.setSpacing(4)
+        self.dot = Dot("text_muted", 10)
+        self.title_label = label(title, muted=True)
+        lay.addLayout(hbox(self.dot, self.title_label, None, spacing=6))
+        self.value_label = label("--", "Stat")
+        lay.addWidget(self.value_label)
+        self.sub_label = label("", muted=True, wrap=True)
+        lay.addWidget(self.sub_label)
+        self.bar = JellyBar(height=10)
+        self.bar.hide()
+        lay.addWidget(self.bar)
+        self.action = button("", "Ghost")
+        self.action.hide()
+        self._on_action = None
+        self.action.clicked.connect(lambda: self._on_action() if self._on_action else None)
+        lay.addWidget(self.action, 0, Qt.AlignLeft)
+        lay.addStretch(1)
+        self.setMinimumWidth(150)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        self.setAccessibleName(title)
+
+    def set(self, value: str, sub: str = "", state: str = "good", bar: float | None = None) -> None:
+        """``state``: good | warning | critical | info | off (no reading). ``bar``: 0..1 or None."""
+        self.state = state
+        self.dot.token = STATE_TOKEN.get(state, "info_strong")
+        self.dot.update()
+        self.value_label.setText(value)
+        self.sub_label.setText(sub)
+        self.sub_label.setVisible(bool(sub))
+        if bar is None:
+            self.bar.hide()
+        else:
+            self.bar.set_segments([(bar, state, STATE_TOKEN.get(state, "info_strong"))], f"{self.title}: {value}")
+            self.bar.show()
+        text = f"{self.title}: {value}" + (f". {sub}" if sub else "")
+        self.setAccessibleDescription(text)
+        self.setToolTip(text.replace(". ", "\n", 1))
+
+    def set_action(self, text: str | None, on_click=None) -> None:
+        self._on_action = on_click
+        self.action.setText(text or "")
+        self.action.setAccessibleName(text or "")
+        self.action.setVisible(bool(text))
 
 
 class RiceCakes(QWidget):
@@ -268,8 +356,10 @@ class RiceCakes(QWidget):
             if x + 22 > self.width():
                 break
             filled = i < shown
-            p.setPen(QPen(QColor(pal.mochi_outline if filled else pal.surface_alt), 1.6))
-            p.setBrush(QColor(pal.mochi_body if filled else pal.background))
+            empty_edge = QColor(pal.text_muted)
+            empty_edge.setAlphaF(0.45)
+            p.setPen(QPen(QColor(pal.mochi_outline) if filled else empty_edge, 1.6))
+            p.setBrush(QColor(pal.mochi_body) if filled else Qt.NoBrush)
             path = QPainterPath()
             path.addRoundedRect(QRectF(x, 8, 20, 16), 8, 8)
             p.drawPath(path)

@@ -12,7 +12,7 @@ import random
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from ..model import GB, MB, Battery, ProcRaw, SystemRaw, Volume
+from ..model import GB, MB, Battery, Fan, ProcRaw, SystemRaw, Volume
 from .base import AccessDenied, BatteryHealth, DiskHealth, FileInfo, Platform, PlatformError, ProcessGone, StartupItem
 
 
@@ -73,6 +73,13 @@ class FakeSystem:
     perf_limit_pct: float | None = 100.0
     run_queue: float | None = 0.0
     temp_c: float | None = None
+    gpu_busy_pct: float | None = None
+    gpu_temp_c: float | None = None
+    gpu_mem_used_gb: float | None = None
+    gpu_mem_total_gb: float | None = None
+    gpu_power_w: float | None = None
+    gpu_name: str | None = None
+    fans: list[Fan] = field(default_factory=list)
     battery: Battery | None = None
     idle_seconds: float = 5.0
     foreground_pid: int | None = None
@@ -206,6 +213,15 @@ class FakePlatform(Platform):
             perf_limit_pct=s.perf_limit_pct,
             run_queue=s.run_queue,
             temp_c=s.temp_c,
+            gpu_busy_pct=s.gpu_busy_pct,
+            gpu_temp_c=s.gpu_temp_c,
+            gpu_mem_used=int(s.gpu_mem_used_gb * GB) if s.gpu_mem_used_gb is not None else None,
+            gpu_mem_total=int(s.gpu_mem_total_gb * GB) if s.gpu_mem_total_gb is not None else None,
+            gpu_power_w=s.gpu_power_w,
+            gpu_name=s.gpu_name,
+            fans=[Fan(f.label, f.rpm, f.max_rpm) for f in s.fans],
+            sources={k: "simulator" for k, v in (("temp", s.temp_c), ("gpu", s.gpu_busy_pct),
+                                                 ("gpu_temp", s.gpu_temp_c), ("fan", s.fans)) if v not in (None, [])},
             battery=copy.copy(s.battery),
             ctx_switches=int(self._ctx),
             interrupts=int(self._irq),
@@ -217,7 +233,10 @@ class FakePlatform(Platform):
             dnd=s.dnd,
             locked=s.locked,
             volumes=[Volume(v.mount, v.total, v.free, v.fixed) for v in s.volumes],
-            unavailable=dict(s.unavailable),
+            unavailable={**{k: why for k, v, why in (
+                ("gpu", s.gpu_busy_pct, "no GPU in the simulator"),
+                ("gpu_temp", s.gpu_temp_c, "no GPU temperature in the simulator"),
+                ("fan", s.fans, "needs admin on this PC")) if v in (None, [])}, **s.unavailable},
         )
 
     def describe_foreground(self, raw: SystemRaw, procs: list[ProcRaw]) -> None:

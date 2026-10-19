@@ -129,6 +129,20 @@ RADIUS_CARD = 20
 RADIUS_INNER = 12
 
 
+def chevron_path(color: str) -> str:
+    """A small down-chevron as an SVG file for the dropdown arrow (QSS needs an image URL)."""
+    import tempfile
+
+    folder = Path(tempfile.gettempdir()) / "mochi_ui"
+    folder.mkdir(exist_ok=True)
+    path = folder / f"chevron_{color.lstrip('#')}.svg"
+    if not path.exists():
+        path.write_text(f"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'><path d='M2.5 4.5L6 8l3.5-3.5' "
+                        f"fill='none' stroke='{color}' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/></svg>",
+                        encoding="utf-8")
+    return path.as_posix()
+
+
 class Theme:
     """The active palette and fonts. Qt pieces are imported lazily."""
 
@@ -186,12 +200,14 @@ class Theme:
                     border-radius: 8px; padding: 6px 8px; }}
         #Card {{ background: {p.surface}; border-radius: {RADIUS_CARD}px; }}
         #CardAlt {{ background: {p.surface_alt}; border-radius: {RADIUS_CARD}px; }}
+        #Tile {{ background: {p.surface_alt}; border-radius: 14px; }}
         #Sidebar {{ background: {p.surface}; border-top-right-radius: 24px; border-bottom-right-radius: 24px; }}
         QLabel {{ background: transparent; }}
         QLabel#Muted, QLabel[muted="true"] {{ color: {p.text_muted}; }}
         QLabel#H1 {{ font-size: 26px; font-weight: 800; }}
         QLabel#H2 {{ font-size: 18px; font-weight: 800; }}
         QLabel#H3 {{ font-size: 15px; font-weight: 700; }}
+        QLabel#Stat {{ font-size: 22px; font-weight: 800; }}
         QPushButton {{ background: {p.surface_alt}; color: {p.text}; border: none; border-radius: 17px;
                        padding: 8px 18px; font-weight: 700; font-size: 14px; min-height: 18px; }}
         QPushButton:hover {{ background: {p.accent}; color: {p.on_fill}; }}
@@ -221,8 +237,7 @@ class Theme:
         QComboBox:focus, QLineEdit:focus {{ border: 2px solid {p.info_strong}; }}
         QComboBox {{ padding-right: 28px; }}
         QComboBox::drop-down {{ border: none; width: 26px; subcontrol-origin: padding; subcontrol-position: center right; }}
-        QComboBox::down-arrow {{ width: 0; height: 0; border-left: 5px solid transparent; border-right: 5px solid transparent;
-                                 border-top: 6px solid {p.text_muted}; margin-right: 10px; }}
+        QComboBox::down-arrow {{ image: url({chevron_path(p.text_muted)}); width: 12px; height: 12px; margin-right: 10px; }}
         QComboBox QAbstractItemView {{ background: {p.surface}; color: {p.text}; border-radius: 8px;
                                        selection-background-color: {p.info}; selection-color: {p.on_fill}; }}
         QCheckBox {{ spacing: 10px; }}

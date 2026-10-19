@@ -149,6 +149,7 @@ class MainWindow(QMainWindow):
         content.addWidget(self.stack, 1)
         root.addLayout(content, 1)
         self.setCentralWidget(central)
+        central.setFocusPolicy(Qt.ClickFocus)
         self.toast_label = Toast(central)
         self._make_pages()
         for i, (key, _t, _i) in enumerate(NAV):
@@ -218,6 +219,10 @@ class MainWindow(QMainWindow):
             anim.finished.connect(lambda: page.setGraphicsEffect(None))
             anim.start()
             self._anim = anim
+
+    def showEvent(self, e) -> None:
+        super().showEvent(e)
+        self.centralWidget().setFocus(Qt.OtherFocusReason)
 
     def show_and_raise(self) -> None:
         self.showNormal()

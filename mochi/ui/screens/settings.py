@@ -94,10 +94,28 @@ class SettingsPage(Page):
             self.motion.addItem(text, val)
         self.motion.setCurrentIndex(max(0, self.motion.findData(cfg.reduce_motion)))
         self.motion.currentIndexChanged.connect(lambda _i: self._set(reduce_motion=self.motion.currentData()))
+        for combo in (self.theme, self.motion):
+            combo.setFixedWidth(240)
         look.add(hbox(label("Theme"), None, self.theme))
         look.add(hbox(label("Motion"), None, self.motion))
         row.addWidget(look, 1)
         self.body.addLayout(row)
+
+        # --- sensors
+        sens = Card(padding=20)
+        sens.add(label("Temperatures and fans", "H2"))
+        sens.add(label("GPU load and memory work on any PC, and NVIDIA GPUs also share their temperature and power. "
+                       "On many laptops the CPU temperature and fan speeds come from firmware sensors that only an "
+                       "administrator can read. Mochi can start a tiny helper that only reads those sensors, with "
+                       "admin permission. Windows asks you first, each time Mochi starts.", muted=True, wrap=True))
+        self.sensor_box = QCheckBox("Read CPU temperature and fan speeds (asks Windows for admin permission)")
+        self.sensor_box.setChecked(cfg.sensor_helper)
+        self.sensor_box.setEnabled(eng.sensor_helper is not None)
+        self.sensor_box.toggled.connect(self._sensors)
+        sens.add(self.sensor_box)
+        self.sensor_text = label("", muted=True, wrap=True, sel=True)
+        sens.add(self.sensor_text)
+        self.body.addWidget(sens)
 
         # --- quiet rules
         quiet = Card(padding=20)
@@ -149,7 +167,7 @@ class SettingsPage(Page):
         self.warn_box = vbox(spacing=8)
         self.body.addLayout(self.warn_box)
         about = label(f"Mochi {__version__} · profile '{eng.profile}' · admin features: "
-                      f"{'available' if eng.platform.is_admin() else 'temperature and SMART need admin'}", muted=True)
+                      f"{'available' if eng.platform.is_admin() else 'disk health (SMART) needs admin'}", muted=True)
         self.body.addWidget(about)
         self.body.addStretch(1)
         self._sensitivity_label()
@@ -161,6 +179,29 @@ class SettingsPage(Page):
             self.ctx.toast(w)
         if self.ctx.window is not None:
             self.ctx.window.config_changed(changes)
+
+    def _sensors(self, on: bool) -> None:
+        for w in self.ctx.engine.set_sensor_helper(on):
+            self.ctx.toast(w)
+        if on:
+            self.ctx.toast("Windows will ask for permission. Readings start a few seconds after you say yes.")
+        self._sensor_status()
+
+    def _sensor_status(self) -> None:
+        eng = self.ctx.engine
+        v = eng.latest
+        lines = []
+        for key, name in (("gpu", "GPU load"), ("gpu_temp", "GPU temperature"), ("temp", "CPU temperature"),
+                          ("fan", "Fans")):
+            src = v.sources.get(key) if v else None
+            why = v.unavailable.get(key) if v else None
+            lines.append(f"{name}: {'from ' + src if src else (why or 'waiting for the first reading')}")
+        helper = eng.sensor_helper
+        if helper is None:
+            lines.append("The admin helper is only available on Windows.")
+        elif helper.message:
+            lines.append(helper.message)
+        self.sensor_text.setText("\n".join(lines))
 
     def _sensitivity(self, v: int) -> None:
         self._set(sensitivity=v)
@@ -263,6 +304,7 @@ class SettingsPage(Page):
         st = eng.status()
         self.data_text.setText(f"Folder: {eng.paths.root}\nDatabase: {st['db_mb']:.1f} MB · readings kept "
                                f"{eng.cfg.raw_days:.0f} days, minute averages {eng.cfg.minute_days:.0f} days, hourly forever")
+        self._sensor_status()
         self._fill_quiet()
         self._fill_table()
         clear_layout(self.warn_box)

@@ -9,17 +9,21 @@ import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QColor
-from PySide6.QtWidgets import QButtonGroup, QHBoxLayout
+from PySide6.QtWidgets import QButtonGroup, QHBoxLayout, QWidget
 
 from ...engine import SampleView
 from ...model import METRICS
 from ..theme import LEVEL_STROKE, THEME
-from ..widgets import Card, Dot, button, hbox, label
+from ..widgets import Card, Dot, FlowLayout, button, hbox, label
 from .common import Page
 
 RANGES = [("1 h", 3600), ("24 h", 86400), ("7 d", 7 * 86400)]
-LABELS = {"cpu": "CPU", "ram": "Memory", "paging": "Paging", "disk": "Disk busy", "temp": "Temperature",
-          "discharge": "Battery drain"}
+LABELS = {"cpu": "CPU", "ram": "Memory", "paging": "Paging", "disk": "Disk busy", "temp": "CPU temp",
+          "gpu": "GPU", "gpu_temp": "GPU temp", "fan": "Fans", "discharge": "Battery drain"}
+AXIS = {"temp": "CPU temperature", "gpu": "GPU busy", "gpu_temp": "GPU temperature", "fan": "Fastest fan"}
+CHIP_ORDER = ("cpu", "ram", "paging", "disk", "gpu", "temp", "gpu_temp", "fan", "discharge")
+PERCENT = ("cpu", "disk", "gpu")
+SENSOR_METRICS = ("temp", "fan")    # the ones the elevated helper can provide
 
 pg.setConfigOptions(antialias=True)
 
@@ -50,16 +54,18 @@ class TimelinePage(Page):
         self.seconds = 3600
         controls = QHBoxLayout()
         controls.setSpacing(8)
+        chips = QWidget()
+        flow = FlowLayout(chips, spacing=8)   # wraps on narrow windows
         self.metric_group = QButtonGroup(self)
-        for key in ("cpu", "ram", "paging", "disk", "temp", "discharge"):
+        for key in CHIP_ORDER:
             b = button(LABELS[key], "Chip")
             b.setCheckable(True)
             b.setChecked(key == self.metric_key)
             b.clicked.connect(lambda _=False, k=key: self.set_metric(k))
             b.setProperty("metric", key)
             self.metric_group.addButton(b)
-            controls.addWidget(b)
-        controls.addStretch(1)
+            flow.addWidget(b)
+        controls.addWidget(chips, 1)
         self.range_group = QButtonGroup(self)
         for text, secs in RANGES:
             b = button(text, "Chip")
@@ -74,7 +80,11 @@ class TimelinePage(Page):
         card = Card(padding=16)
         self.unavailable = label("", muted=True, wrap=True)
         self.unavailable.hide()
-        card.add(self.unavailable)
+        self.fix_button = button("Turn on CPU temperature and fans", "Primary", on_click=self._turn_on_sensors)
+        self.fix_button.hide()
+        notice = hbox(self.unavailable, self.fix_button, spacing=14)
+        notice.setStretch(0, 1)
+        card.add(notice)
         self.plot = pg.PlotWidget(axisItems={"bottom": pg.DateAxisItem()})
         self.plot.setMinimumHeight(380)
         self.plot.setMenuEnabled(False)
@@ -111,6 +121,11 @@ class TimelinePage(Page):
             a.setTextPen(pg.mkPen(pal.text_muted))
             a.setStyle(tickFont=THEME.font(11, 600))
 
+    def _turn_on_sensors(self) -> None:
+        self.ctx.engine.set_sensor_helper(True)
+        self.ctx.toast("Windows will ask for permission. Readings start a few seconds after you say yes.")
+        self.refresh()
+
     def set_metric(self, key: str) -> None:
         self.metric_key = key
         for b in self.metric_group.buttons():
@@ -139,8 +154,9 @@ class TimelinePage(Page):
         info = METRICS[m]
         val = v.metrics.get(m)
         b = v.bands.get(m)
+        d = 0 if info.unit == "RPM" else 1
         if not self.ctx.nerd():
-            self.nerd_label.setText(f"Now: {val:.1f} {info.unit}" if val is not None else "")
+            self.nerd_label.setText(f"Now: {val:,.{d}f} {info.unit}" if val is not None else "")
             return
         z = v.z.get(m)
         parts = [f"now {val:.2f} {info.unit}" if val is not None else "now: n/a"]
@@ -160,7 +176,11 @@ class TimelinePage(Page):
             reason = reason or "You're plugged in, so there's no battery drain to show right now."
         self.unavailable.setVisible(bool(reason))
         if reason:
-            self.unavailable.setText(f"{LABELS[self.metric_key]} isn't available: {reason}.")
+            name = AXIS.get(self.metric_key, LABELS[self.metric_key])
+            self.unavailable.setText(f"{name} isn't available: {reason}.")
+        helper = eng.sensor_helper
+        self.fix_button.setVisible(bool(reason) and self.metric_key in SENSOR_METRICS and helper is not None
+                                   and helper.state in ("off", "declined", "failed") and "admin" in (reason or ""))
         try:
             data = eng.timeline(self.metric_key, self.seconds)
         except Exception as exc:
@@ -184,9 +204,11 @@ class TimelinePage(Page):
                          np.nan if r[3] is None else r[3]] for r in rows], dtype=float)
         ts, val, mu, sd = arr[:, 0], arr[:, 1], arr[:, 2], arr[:, 3]
         lo, hi = mu - 2 * sd, mu + 2 * sd
-        if self.metric_key in ("cpu", "disk"):
+        if self.metric_key in PERCENT:
             lo = np.clip(lo, 0, 100)
             hi = np.clip(hi, 0, 100)
+        else:
+            lo = np.clip(lo, 0, None)
         good = QColor(pal.good)
         good.setAlphaF(0.30 if pal.name == "light" else 0.22)
         edge = pg.mkPen(QColor(pal.good_strong), width=1)
@@ -217,12 +239,21 @@ class TimelinePage(Page):
             self.plot.addItem(sc)
             self._items.append(sc)
         info = METRICS[self.metric_key]
-        self.plot.setLabel("left", f"{LABELS[self.metric_key]} ({info.unit})", color=pal.text_muted)
+        self.plot.setLabel("left", f"{AXIS.get(self.metric_key, LABELS[self.metric_key])} ({info.unit})",
+                           color=pal.text_muted)
         self.plot.setXRange(ts[-1] - self.seconds, ts[-1], padding=0.01)
         finite = val[~np.isnan(val)]
-        if finite.size:
+        if not finite.size:
+            name = AXIS.get(self.metric_key, LABELS[self.metric_key])
+            first = name.split()[0]
+            if not first.isupper():   # keep "CPU"/"GPU", lower-case "Memory" -> "memory"
+                name = name[0].lower() + name[1:]
+            self.summary.setText(f"No {name} readings in this range yet.")
+        else:
             within = np.mean((val[mask] >= lo[mask]) & (val[mask] <= hi[mask])) * 100 if mask.any() else None
-            parts = [f"{len(rows)} readings", f"average {finite.mean():.1f} {info.unit}", f"peak {finite.max():.1f} {info.unit}"]
+            d = 0 if info.unit == "RPM" else 1
+            parts = [f"{len(rows)} readings", f"average {finite.mean():,.{d}f} {info.unit}",
+                     f"peak {finite.max():,.{d}f} {info.unit}"]
             if within is not None:
                 parts.append(f"{within:.0f}% inside your normal band")
             parts.append(f"{len(data['markers'])} unusual moment{'s' if len(data['markers']) != 1 else ''}")
