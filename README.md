@@ -10,6 +10,7 @@ drive is nearly full.
 
 - Concept: [Mochi - Baseline-Aware PC Health Buddy.pdf](Mochi%20-%20Baseline-Aware%20PC%20Health%20Buddy.pdf)
 - Critique and acceptance criteria: [Mochi - Critique and Acceptance Criteria.md](Mochi%20-%20Critique%20and%20Acceptance%20Criteria.md)
+- Technical specification (every feature, how it works, all settings): [Mochi - Technical Specification.md](Mochi%20-%20Technical%20Specification.md)
 - Case study report: [Mochi - OS Case Study.pdf](Mochi%20-%20OS%20Case%20Study.pdf)
 
 ## Setup and running
@@ -42,7 +43,7 @@ into the repo, and Mochi never connects to the internet.
 ```
 Windows ──> Collector thread ──(bounded queue)──> Processing thread ──> SQLite (WAL, writer thread)
             every 5 s                             │
-                                                  ├─ Baselines: EWMA per hour-of-week x activity
+                                                  ├─ Baselines: EWMA per hour x weekday/weekend x activity
                                                   ├─ Detector: sustained z-scores, absolute limits
                                                   ├─ Trends: leak, disk filling, runaway process
                                                   ├─ Diagnosis: ordered rules -> cause, culprit, tip
@@ -138,10 +139,9 @@ Measured on the development laptop (Intel Core i9-14900HX, 32 threads, 32 GB, Wi
 
 | Measure | Target | Result |
 | --- | --- | --- |
-| Mochi's CPU, tray only | < 2% of total | 0.35% (90 s average) |
-| Mochi's CPU, dashboard open | < 5% of total | 0.34% average, 1.3% peak (about 11% of one core on average) |
-| Mochi's memory | < 100 MB private | 95 MB peak |
-| Background engine alone | < 2% CPU, < 100 MB | Passed (`test_headless_overhead_is_small`) |
+| Background engine alone | < 2% CPU, < 100 MB | 0.02% average, 34 MB peak (2 minutes) |
+| Dashboard, rendered offscreen | < 5% CPU, < 100 MB | 0.30% average, 0.68% peak, 98 MB peak (2 minutes) |
+| Real window, 15 minutes after start | < 5% CPU, < 100 MB | 1.9% CPU passes; **172 MB misses the memory target** |
 | Reading all processes | Cheap | One system call vs about 430 ms of CPU per scan with psutil |
 | Memory hog, simulated | Popup within 7 min | Passed; Puffy within 30 s |
 | Runaway, one core and all cores | Within 6 min | Passed; also caught on this PC with `tools/cpu_burner.py` |
@@ -186,10 +186,16 @@ The real-machine tests put light, capped load on the PC (about 30 s of one CPU c
 ## Known limitations
 
 - CPU temperature and fan speeds need LibreHardwareMonitor or, on Lenovo laptops, the optional
-  admin helper; SMART details need admin. Without them Mochi shows "unavailable (reason)", never 0.
-- GPU temperature needs a driver that reports it to Windows (recent NVIDIA and AMD drivers do;
-  many integrated GPUs don't). GPU power isn't shown. Lenovo fan readings are labelled Fan 1 and
-  Fan 2, because the firmware doesn't say which fan cools what.
+  admin helper. Without them Mochi shows "unavailable (reason)", never 0.
+- Lenovo fan readings don't work yet: on the development laptop both fans always report 0 RPM,
+  even at 95 °C, so Mochi wrongly shows "Stopped (quiet)". The GPU can also read 1 °C while idle.
+- GPU temperature needs a driver that reports it to Windows, and many integrated GPUs don't.
+  GPU power isn't shown.
+- Memory: a long-running window exceeds the 100 MB target (172 MB after 15 minutes). Short runs
+  understate it because the in-memory history is still filling.
+- Started from a terminal inside an MSIX-packaged app, Mochi uses a separate private data folder.
+  The [specification](Mochi%20-%20Technical%20Specification.md#files) explains why.
+- `smartctl` isn't run: disk health comes from Windows Storage status.
 - GPU readings don't raise alerts yet, and network and per-app power use are not monitored.
 - Windows' Do Not Disturb is detected only through the "quiet time" notification state.
 - The Linux/macOS adapter (`platform/generic.py`) is best effort and untested on those systems.
