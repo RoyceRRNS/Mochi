@@ -220,7 +220,7 @@ Mochi runs in the system tray, samples the OS every 5 seconds, and learns what n
 ### Overview
 
 ```mermaid
-flowchart LR
+flowchart TB
     OS["Windows APIs"] --> PLAT["Platform adapter"]
     HELPER["Optional admin helper"] -.->|"sensors.json"| COLL
     PLAT --> COLL["Collector thread<br/>every 5 s"]
